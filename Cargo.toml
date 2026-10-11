@@ -1,0 +1,20 @@
+[package]
+name = "cvdb"
+version = "0.1.0"
+edition = "2024"
+description = "Streaming JSON Lines reader and compact value document command"
+license = "FSL-1.1-ALv2"
+readme = "README.md"
+repository = "https://git.corbet.ch/corbet-libs/cvdb"
+keywords = ["json", "jsonl", "ndjson"]
+categories = ["encoding", "command-line-utilities"]
+include = ["src/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE.md"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

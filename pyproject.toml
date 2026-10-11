@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cvdb"
+version = "0.1.0"
+description = "Native JSON Lines validation and compaction command"
+readme = "README.md"
+license = "FSL-1.1-ALv2"
+license-files = ["LICENSE.md"]
+
+[project.urls]
+Repository = "https://git.corbet.ch/corbet-libs/cvdb"
+
+[tool.maturin]
+bindings = "bin"

@@ -1,0 +1,15 @@
+{
+  "name": "@corbet-labs/cvdb",
+  "version": "0.1.0",
+  "description": "JSON Lines text parsing utilities",
+  "type": "module",
+  "exports": { ".": "./mod.ts" },
+  "types": "./mod.ts",
+  "files": ["mod.ts", "README.md", "LICENSE.md"],
+  "license": "FSL-1.1-ALv2",
+  "repository": {
+    "type": "git",
+    "url": "git+https://git.corbet.ch/corbet-libs/cvdb.git"
+  },
+  "publishConfig": { "access": "public" }
+}
