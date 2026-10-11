@@ -3,9 +3,12 @@
   "version": "0.1.0",
   "description": "JSON Lines text parsing utilities",
   "type": "module",
-  "exports": { ".": "./mod.ts" },
-  "types": "./mod.ts",
-  "files": ["mod.ts", "README.md", "LICENSE.md"],
+  "exports": { ".": { "types": "./dist/mod.d.ts", "import": "./dist/mod.js" } },
+  "types": "./dist/mod.d.ts",
+  "files": ["dist/mod.js", "dist/mod.d.ts", "README.md", "LICENSE.md"],
+  "scripts": {
+    "build": "deno bundle --check --declaration --format esm mod.ts --output dist/mod.js"
+  },
   "license": "FSL-1.1-ALv2",
   "repository": {
     "type": "git",

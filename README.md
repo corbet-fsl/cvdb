@@ -13,9 +13,8 @@ or checks the input with `--check`.
 use std::io::Cursor;
 
 let input = Cursor::new("{\"id\":1}\n{\"id\":2}\n");
-let records = cvdb::values(input).collect::<std::io::Result<Vec<_>>>()?;
+let records = cvdb::values(input).collect::<std::io::Result<Vec<_>>>().unwrap();
 assert_eq!(records.len(), 2);
-# Ok::<(), std::io::Error>(())
 ```
 
 ## TypeScript
@@ -26,8 +25,8 @@ import { parseJsonLines } from "@corbet-labs/cvdb";
 const records = parseJsonLines('{"id":1}\n{"id":2}\n');
 ```
 
-Use `jsr:@corbet-labs/cvdb` for Deno. npm ships TypeScript source and requires
-a runtime or build tool with TypeScript support.
+Use `jsr:@corbet-labs/cvdb` for Deno. npm ships generated JavaScript and
+TypeScript declarations; JSR ships the TypeScript source.
 
 ## Command
 
