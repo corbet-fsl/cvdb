@@ -11,7 +11,7 @@ license = "FSL-1.1-ALv2"
 license-files = ["LICENSE.md"]
 
 [project.urls]
-Repository = "https://git.corbet.ch/corbet-libs/cvdb"
+Repository = "https://git.corbet.ch/corbet-fsl/cvdb"
 
 [tool.maturin]
 bindings = "bin"

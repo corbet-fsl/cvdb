@@ -12,7 +12,7 @@
   "license": "FSL-1.1-ALv2",
   "repository": {
     "type": "git",
-    "url": "git+https://git.corbet.ch/corbet-libs/cvdb.git"
+    "url": "git+https://git.corbet.ch/corbet-fsl/cvdb.git"
   },
   "publishConfig": { "access": "public" }
 }
