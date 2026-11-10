@@ -8,7 +8,7 @@ readme = "README.md"
 repository = "https://git.corbet.ch/corbet-libs/cvdb"
 keywords = ["json", "jsonl", "ndjson"]
 categories = ["encoding", "command-line-utilities"]
-include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE.md"]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE.md", ".cargo/release-profile.toml"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -15,3 +15,7 @@ Repository = "https://git.corbet.ch/corbet-libs/cvdb"
 
 [tool.maturin]
 bindings = "bin"
+# Release flags live in .cargo/release-profile.toml, never in a manifest
+# [profile] table: maturin passes this path to cargo as --config, so the
+# published wheel keeps the release profile this repo builds with.
+config = [".cargo/release-profile.toml"]
