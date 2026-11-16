@@ -2,6 +2,8 @@
 //! framed `GET /workspaces/:id/sub/:sub` and `POST /workspaces/:id/append`. For tests; it never
 //! touches the network. Enabled by the `fake-server` feature.
 
+#![allow(clippy::too_many_lines, clippy::must_use_candidate)]
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
