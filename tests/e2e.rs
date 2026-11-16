@@ -492,7 +492,8 @@ fn cold_load_and_live(stack: &Stack) {
             .iter()
             .filter(|r| r.path.starts_with("sub/"))
             .count(),
-        2
+        2 + 5,
+        "two profile sub-documents plus the five routing shadows"
     );
 
     // Second load: the cached state answers 304.
@@ -504,7 +505,7 @@ fn cold_load_and_live(stack: &Stack) {
     let subs: Vec<_> = spy_b2
         .recs()
         .into_iter()
-        .filter(|r| r.path.starts_with("sub/"))
+        .filter(|r| r.path.starts_with("sub/c"))
         .collect();
     assert_eq!(subs.len(), 2);
     assert!(
@@ -736,12 +737,45 @@ fn budget(stack: &Stack) {
         counts.get(Kind::Upgrade),
         counts.api_total()
     );
-    assert!(counts.api_total() <= 160, "{}", counts.api_total());
+    assert!(counts.api_total() <= 165, "{}", counts.api_total());
     assert_eq!(
         counts.get(Kind::Upgrade),
         1,
         "one relay upgrade, no reconnects"
     );
+
+    // A busy browser peer: 300 foreign `settings` frames (more than cvws holds back) reach the
+    // client through the relay. With the shadows loaded they are attributed exactly: no frame is
+    // held and evicted, no resync flag, no extra read.
+    let sub_before = counts.get(Kind::Sub);
+    let ops: Vec<Value> = (0..300)
+        .map(|i| json!({ "kind": "settings.update", "patch": { "colorPrimary": format!("#{:06x}", 0x10_0000 + i) } }))
+        .collect();
+    let file = tmp("foreign").join("ops.json");
+    std::fs::write(&file, serde_json::to_vec(&ops).unwrap()).unwrap();
+    ts_peer(stack, &["edit", &ws, file.to_str().unwrap()]);
+    let mut foreign = 0;
+    let mut frames = 0;
+    wait_for(|| {
+        while let Ok(ev) = rx.recv_timeout(Duration::from_millis(20)) {
+            if let Event::Update(u) = ev {
+                let applied = a.apply_live(&u).unwrap();
+                foreign += applied.foreign;
+                frames += 1;
+            }
+        }
+        (frames >= 300).then_some(())
+    });
+    println!(
+        "budget foreign peer: {frames} frames, {foreign} attributed to shadows, extra sub reads {}",
+        counts.get(Kind::Sub) - sub_before
+    );
+    assert_eq!(
+        counts.get(Kind::Sub),
+        sub_before,
+        "foreign frames cost no read"
+    );
+    assert!(foreign >= 300, "{foreign}");
 
     // The resync flag raised a hundred times inside five minutes costs one resync.
     let sub0 = counts.get(Kind::Sub);

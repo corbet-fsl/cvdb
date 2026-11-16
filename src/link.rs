@@ -73,12 +73,33 @@ impl Link {
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        sync_parent(path)?;
         Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Self> {
         Self::parse(&std::fs::read_to_string(path)?)
     }
+}
+
+/// fsync the directory that holds `path`, so a rename into it survives a crash.
+pub(crate) fn sync_parent(path: &Path) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Create `dir` (and parents) with mode 0700.
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    Ok(())
 }
 
 pub(crate) fn open_private(path: &Path) -> Result<std::fs::File> {

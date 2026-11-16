@@ -18,6 +18,7 @@ base64 = "0.22"
 sha2 = "0.10"
 fastrand = "2"
 ureq = "3"
+socket2 = { version = "0.6", features = ["all"] }
 tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 [lints.rust]

@@ -31,11 +31,17 @@ const client = new WorkspaceClient({
 const accepted: { sub: string; opId: string; update: Uint8Array }[] = [];
 client.onAccepted((sub: string, opId: string, update: Uint8Array) => accepted.push({ sub, opId, update }));
 const b64 = (u: Uint8Array) => Buffer.from(u).toString('base64');
-const subOf = (op: any) => (String(op.branch_path ?? op.kind).startsWith('cl_') || String(op.kind).startsWith('cl_') ? 'cl-profile' : 'cv-profile');
+const subOf = (op: any) =>
+	String(op.kind).startsWith('settings.')
+		? 'settings'
+		: String(op.branch_path ?? op.kind).startsWith('cl_') || String(op.kind).startsWith('cl_')
+			? 'cl-profile'
+			: 'cv-profile';
 
 async function run(ops: any[]) {
 	await client.read('cv-profile');
 	await client.read('cl-profile');
+	await client.read('settings');
 	for (const op of ops) await client.applyOp(subOf(op), op);
 }
 

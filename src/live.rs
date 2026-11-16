@@ -11,6 +11,7 @@ use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tungstenite::client::IntoClientRequest;
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -20,7 +21,15 @@ pub enum Event {
     /// Update bytes from another peer (or the server's canonical bytes).
     Update(Vec<u8>),
     Disconnected,
+    /// The relay answered the upgrade with a 4xx (for example 404, a deleted workspace):
+    /// retrying cannot help, the thread stopped.
+    Gone(u16),
 }
+
+/// How long a connection must have lasted before the backoff starts over: a relay that
+/// accepts and then closes must not be retried every second (each attempt is a billed request).
+pub const STABLE_AFTER: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Seconds to wait before attempt number `attempt` (0 = the first retry): 1, 2, 4 ...
 /// capped at 60, scaled by `jitter` in `0.0..=1.0` to between 90% and 100%, never under 1 s.
@@ -108,8 +117,70 @@ impl Live {
 }
 
 impl Drop for Live {
+    /// Never blocks: the thread sees the flag within a quarter second (or after its connect
+    /// timeout) and ends on its own.
     fn drop(&mut self) {
-        self.stop();
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Why a connection attempt failed.
+enum Connect {
+    /// Retry with backoff.
+    Retry,
+    /// A 4xx answer to the upgrade (not 408/429): stop.
+    Gone(u16),
+}
+
+type Socket = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
+
+/// TCP connect with a timeout and keepalive (kernel probes, no billed message), then the
+/// WebSocket handshake under a read/write timeout, with frame limits just above the cap that
+/// `relay_update` enforces, so a link holder cannot make every client buffer 64 MiB.
+fn connect(url: &str) -> std::result::Result<Socket, Connect> {
+    use std::net::ToSocketAddrs;
+    let mut req = url.into_client_request().map_err(|_| Connect::Retry)?;
+    req.headers_mut()
+        .insert("x-cv-actor-class", "human".parse().expect("header"));
+    let uri = req.uri().clone();
+    let host = uri.host().ok_or(Connect::Retry)?.to_owned();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|_| Connect::Retry)?
+        .next()
+        .ok_or(Connect::Retry)?;
+    let stream =
+        std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|_| Connect::Retry)?;
+    let _ = stream.set_nodelay(true);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(15))
+        .with_retries(3);
+    let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&ka);
+    let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONNECT_TIMEOUT));
+    let cap = frames::MAX_FRAME + 64;
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(cap))
+        .max_frame_size(Some(cap));
+    match tungstenite::client_tls_with_config(req, stream, Some(config), None) {
+        Ok((mut ws, _)) => {
+            set_timeout(&mut ws);
+            Ok(ws)
+        }
+        Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)))
+            if r.status().is_client_error() && !matches!(r.status().as_u16(), 408 | 429) =>
+        {
+            Err(Connect::Gone(r.status().as_u16()))
+        }
+        Err(_) => Err(Connect::Retry),
     }
 }
 
@@ -132,21 +203,24 @@ fn run(
     while !stop.load(Ordering::SeqCst) {
         // The first relay that answers wins; the list is walked in order on every reconnect.
         let mut socket = None;
+        let mut gone = None;
         for base in relays {
             counts.bump(Kind::Upgrade);
-            let Ok(mut req) = ws_url(base, ws_id, device).into_client_request() else {
-                continue;
-            };
-            req.headers_mut()
-                .insert("x-cv-actor-class", "human".parse().expect("header"));
-            if let Ok((ws, _)) = tungstenite::connect(req) {
-                socket = Some(ws);
-                break;
+            match connect(&ws_url(base, ws_id, device)) {
+                Ok(ws) => {
+                    socket = Some(ws);
+                    break;
+                }
+                Err(Connect::Gone(s)) => gone = Some(s),
+                Err(Connect::Retry) => {}
             }
         }
+        if socket.is_none() && gone.is_some_and(|_| relays.len() == 1) {
+            let _ = tx.send(Event::Gone(gone.unwrap_or(404)));
+            return;
+        }
         if let Some(mut ws) = socket {
-            set_timeout(&mut ws);
-            attempt = 0;
+            let since = std::time::Instant::now();
             let _ = tx.send(Event::Connected);
             while !stop.load(Ordering::SeqCst) {
                 match ws.read() {
@@ -170,9 +244,25 @@ fn run(
             }
             let _ = ws.close(None);
             let _ = tx.send(Event::Disconnected);
+            attempt = next_attempt(attempt, since.elapsed());
+            if attempt == 0 {
+                // a stable connection: the first retry is quick
+                continue;
+            }
         }
         sleep_unless_stopped(backoff(attempt, fastrand::f64()), stop);
         attempt = attempt.saturating_add(1);
+    }
+}
+
+/// The backoff step after a connection that lasted `connected_for`: it starts over only
+/// after a stable one, so a relay that accepts and then closes is not hammered.
+#[must_use]
+pub fn next_attempt(attempt: u32, connected_for: Duration) -> u32 {
+    if connected_for >= STABLE_AFTER {
+        0
+    } else {
+        attempt
     }
 }
 

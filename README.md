@@ -34,6 +34,23 @@ server-applied mode: queued ops go through `/ops` with the same opId and the doc
 from the server, so the server's bytes are the only copy. A flag flipped back to `append` is noticed by
 the five-minute probe.
 
+## Rules for hosts
+
+* **Logging (hard rule).** The private link is a bearer secret and lives in request URLs. `tungstenite`
+  logs `Trying to contact <uri>` at debug level and `ureq` logs URLs at trace level, so a host that
+  installs a logger must keep the `tungstenite` and `ureq` log targets at `info` or below. cvdb itself
+  logs nothing and its errors never carry a URL.
+* **One instance per directory.** `Cvdb::open` takes an exclusive lock on `cfg.dir/lock` and refuses a
+  second instance (`Error::Locked`). The directory is 0700, every file 0600.
+* **Queue behaviour.** Entries are sent strictly in order and an edit queues behind older ones. Only the
+  API's own refusals (JSON `{"error": ...}` with status 400 or 422) park an entry; a 426 (catalog
+  mismatch), an edge page or any other answer keeps it queued. A parked append entry makes the later
+  ones derive their bytes again against the reloaded document.
+* **Frames.** Relay and tail frames are capped at 1 MiB, the stored head at 32 MiB (it is a whole state).
+  WebSocket messages are limited to the same cap plus 64 bytes.
+* **Shadows.** `attach` loads the five non-profile sub-documents once as routing shadows (5 reads), so a
+  busy browser peer's frames never pile up and evict into resyncs.
+
 ## Cloudflare budget
 
 No request per keystroke. One `/append` per committed edit (blur or confirm); a `batch` is one request;

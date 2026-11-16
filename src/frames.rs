@@ -5,6 +5,11 @@ use crate::error::{Error, Result};
 /// Frames over this size are refused without being decoded (the `cvws` cap).
 pub const MAX_FRAME: usize = cvws::MAX_FRAME_BYTES;
 
+/// The first frame of a framed body is the stored head, a whole state: `cvws` puts no cap on
+/// whole states, so it gets a larger one (heads are about 20 KB today). Merged tails and relay
+/// frames stay under [`MAX_FRAME`].
+pub const MAX_HEAD: usize = 32 << 20;
+
 /// Relay tag: Yjs sync.
 pub const MSG_SYNC: u64 = 0;
 const SYNC_STEP2: u64 = 1;
@@ -43,9 +48,13 @@ pub fn write_var_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn read_var_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
+    read_var_bytes_capped(buf, pos, MAX_FRAME)
+}
+
+fn read_var_bytes_capped<'a>(buf: &'a [u8], pos: &mut usize, cap: usize) -> Result<&'a [u8]> {
     let len =
         usize::try_from(read_var_uint(buf, pos)?).map_err(|_| Error::Protocol("length".into()))?;
-    if len > MAX_FRAME {
+    if len > cap {
         return Err(Error::Protocol("frame over the cap".into()));
     }
     let end = pos
@@ -64,7 +73,8 @@ pub fn split_frames(body: &[u8], expected: usize) -> Result<Vec<&[u8]>> {
     let mut pos = 0;
     let mut out = Vec::new();
     while pos < body.len() {
-        out.push(read_var_bytes(body, &mut pos)?);
+        let cap = if out.is_empty() { MAX_HEAD } else { MAX_FRAME };
+        out.push(read_var_bytes_capped(body, &mut pos, cap)?);
         if out.len() > expected {
             return Err(Error::Protocol("more frames than announced".into()));
         }
@@ -134,10 +144,15 @@ mod tests {
 
     #[test]
     fn oversize_frame_refused_before_decoding() {
-        let mut body = Vec::new();
+        // A tail frame over the cap is refused; the head (a whole state) has the larger cap.
+        let mut body = encode_frames(&[b"head"]);
         write_var_uint(&mut body, (MAX_FRAME + 1) as u64);
         body.extend(std::iter::repeat_n(0u8, 16));
-        assert!(split_frames(&body, 1).is_err());
+        assert!(split_frames(&body, 2).is_err());
+        let mut head = Vec::new();
+        write_var_uint(&mut head, (MAX_HEAD + 1) as u64);
+        head.extend(std::iter::repeat_n(0u8, 16));
+        assert!(split_frames(&head, 1).is_err());
     }
 
     #[test]

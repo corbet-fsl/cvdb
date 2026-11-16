@@ -22,6 +22,9 @@ pub enum EntryKind {
     Append,
     /// An op envelope for the server-applied `/ops` path (no bytes).
     Ops,
+    /// An op whose bytes are not derived yet: it is applied to the reloaded document and
+    /// becomes an `Append` entry (after a parked predecessor, whose clocks later bytes depend on).
+    Reapply,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -58,6 +61,7 @@ impl Entry {
         let kind = match self.kind {
             EntryKind::Append => "append",
             EntryKind::Ops => "ops",
+            EntryKind::Reapply => "reapply",
         };
         serde_json::to_vec(
             &json!({"opId": self.op_id, "kind": kind, "op": self.op, "updates": updates}),
@@ -70,6 +74,7 @@ impl Entry {
         let kind = match v.get("kind")?.as_str()? {
             "append" => EntryKind::Append,
             "ops" => EntryKind::Ops,
+            "reapply" => EntryKind::Reapply,
             _ => return None,
         };
         let mut updates = BTreeMap::new();
@@ -95,10 +100,15 @@ pub struct Outbox {
 
 impl Outbox {
     pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        crate::link::create_private_dir(dir)?;
         let path = dir.join("outbox.log");
         let parked_path = dir.join("parked.log");
-        let text = std::fs::read(&path).unwrap_or_default();
+        // Only a missing file is an empty outbox: any other read error must not turn into one.
+        let text = match std::fs::read(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
         let mut entries: Vec<Entry> = Vec::new();
         let mut done: BTreeSet<String> = BTreeSet::new();
         let mut notices = Vec::new();
@@ -158,9 +168,24 @@ impl Outbox {
     pub fn append(&mut self, entry: &Entry) -> Result<()> {
         let payload = entry.to_json();
         let line = format!("E\t{}\t{}\n", checksum(&payload), B64.encode(&payload));
-        self.file.write_all(line.as_bytes())?;
-        self.file.sync_all()?;
+        let before = self.file.metadata()?.len();
+        let written = self
+            .file
+            .write_all(line.as_bytes())
+            .and_then(|()| self.file.sync_all());
+        if let Err(e) = written {
+            // A partial line must not glue onto the next entry.
+            let _ = self.file.set_len(before);
+            return Err(e.into());
+        }
         self.pending.push(entry.clone());
+        Ok(())
+    }
+
+    /// Replace every pending entry (same order, possibly changed kind or bytes), atomically.
+    pub fn replace_all(&mut self, entries: &[Entry]) -> Result<()> {
+        self.file = rewrite(&self.path, entries)?;
+        self.pending = entries.to_vec();
         Ok(())
     }
 
@@ -188,6 +213,20 @@ impl Outbox {
         self.ack(op_id)
     }
 
+    /// Test hook: make every following write fail with ENOSPC (`/dev/full`).
+    #[doc(hidden)]
+    pub fn inject_write_failure(&mut self) -> Result<()> {
+        self.file = std::fs::OpenOptions::new().write(true).open("/dev/full")?;
+        Ok(())
+    }
+
+    /// Test hook: reopen the real file after [`Outbox::inject_write_failure`].
+    #[doc(hidden)]
+    pub fn repair(&mut self) -> Result<()> {
+        self.file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
+        Ok(())
+    }
+
     #[must_use]
     pub fn pending(&self) -> &[Entry] {
         &self.pending
@@ -200,9 +239,11 @@ impl Outbox {
 }
 
 fn park_line(path: &Path, reason: &str, line: &[u8]) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)?;
     f.write_all(format!("{reason}\t{}\n", B64.encode(line)).as_bytes())?;
     f.sync_all()?;

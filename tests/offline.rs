@@ -144,12 +144,13 @@ fn errors_never_carry_the_link() {
 fn oversize_frames_are_refused_not_decoded() {
     // Announced as framed, one frame over the 1 MiB cap.
     let mut body = Vec::new();
+    cvdb::frames::write_var_bytes(&mut body, &[0, 0]);
     cvdb::frames::write_var_uint(&mut body, (cvdb::frames::MAX_FRAME + 1) as u64);
     body.extend(vec![0u8; 64]);
     let http = Arc::new(Fake {
         handler: Box::new(move |m, u, _| match m {
             "GET" if u.ends_with(SECRET) => resp(200, &[], &workspace_json("append")),
-            "GET" => resp(200, &[("x-cv-update-frames", "1")], &body),
+            "GET" => resp(200, &[("x-cv-update-frames", "2")], &body),
             _ => resp(404, &[], b""),
         }),
         seen: Mutex::default(),

@@ -30,6 +30,10 @@ pub enum Error {
     Engine(String),
     /// Local storage failed.
     Io(String),
+    /// Another instance holds the directory.
+    Locked,
+    /// The engine thread is gone.
+    EngineStopped,
 }
 
 impl fmt::Display for Error {
@@ -47,6 +51,8 @@ impl fmt::Display for Error {
             Self::ModeUnknown => f.write_str("write path unknown (attach while online first)"),
             Self::Engine(m) => write!(f, "engine: {m}"),
             Self::Io(m) => write!(f, "storage: {m}"),
+            Self::Locked => f.write_str("another instance uses this directory"),
+            Self::EngineStopped => f.write_str("engine stopped"),
         }
     }
 }
