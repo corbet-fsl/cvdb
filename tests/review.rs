@@ -646,7 +646,10 @@ fn walker_moves_to_the_second_relay_after_two_bad_closes() {
     let pace = Arc::new(SimPace(Mutex::default()));
     let (tx, _rx) = std::sync::mpsc::channel();
     let live = Live::spawn_with(
-        vec![format!("http://127.0.0.1:{bad}"), format!("http://127.0.0.1:{good}")],
+        vec![
+            format!("http://127.0.0.1:{bad}"),
+            format!("http://127.0.0.1:{good}"),
+        ],
         "abcdef".into(),
         "dev".into(),
         counts.clone(),
@@ -658,9 +661,18 @@ fn walker_moves_to_the_second_relay_after_two_bad_closes() {
         std::thread::sleep(Duration::from_millis(10));
     }
     live.stop();
-    assert_eq!(good_n.load(Ordering::SeqCst), 1, "settled on the fallback relay");
+    assert_eq!(
+        good_n.load(Ordering::SeqCst),
+        1,
+        "settled on the fallback relay"
+    );
     // bad, bad (two closes), then the good one: three upgrades, not an endless CF loop.
-    assert_eq!(counts.get(Kind::Upgrade), 3, "{}", counts.get(Kind::Upgrade));
+    assert_eq!(
+        counts.get(Kind::Upgrade),
+        3,
+        "{}",
+        counts.get(Kind::Upgrade)
+    );
 }
 
 #[test]
@@ -671,7 +683,10 @@ fn walker_budget_with_both_relays_closing_stays_bounded() {
     let pace = Arc::new(SimPace(Mutex::default()));
     let (tx, _rx) = std::sync::mpsc::channel();
     let live = Live::spawn_with(
-        vec![format!("http://127.0.0.1:{a}"), format!("http://127.0.0.1:{b}")],
+        vec![
+            format!("http://127.0.0.1:{a}"),
+            format!("http://127.0.0.1:{b}"),
+        ],
         "abcdef".into(),
         "dev".into(),
         counts.clone(),
@@ -688,7 +703,10 @@ fn walker_budget_with_both_relays_closing_stays_bounded() {
     let upgrades = counts.get(Kind::Upgrade);
     assert!(*pace.0.lock().unwrap() >= Duration::from_secs(600));
     // Still one upgrade per backoff step: a second relay adds no attempts when the first accepts.
-    assert!(upgrades <= 19, "{upgrades} upgrades in ten simulated minutes");
+    assert!(
+        upgrades <= 19,
+        "{upgrades} upgrades in ten simulated minutes"
+    );
 }
 
 #[test]
