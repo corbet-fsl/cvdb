@@ -1,5 +1,9 @@
 # cvdb
 
+<!-- ccid:security:begin (rendered by ccid render; do not edit by hand) -->
+**Security and dependencies:** watched by Renovate (with OSV vulnerability alerts); an update is merged only when its tests pass. See the [security policy](SECURITY.md).
+<!-- ccid:security:end -->
+
 The workspace sync client for [CareerVector](https://careervector.corbet.ch), over the
 [`cvws`](https://git.corbet.ch/corbet-fsl/cvws) workspace API. It moves bytes and typed
 envelopes between a `cvws::Workspace` and a workspace server; it never reads what the
