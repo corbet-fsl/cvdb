@@ -15,6 +15,8 @@ include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICEN
 default = ["sqlite"]
 # The SQLite storage backend (`cvdb::store`), speaking the cvfs record vocabulary.
 sqlite = ["dep:rusqlite", "dep:cvfs"]
+# An in-process light server for tests of `remote` (no network).
+fake-server = []
 
 [dependencies]
 cvfs = { git = "https://git.corbet.ch/corbet-fsl/cvfs.git", branch = "main", optional = true }
@@ -29,6 +31,8 @@ tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Integration tests use the in-process light server.
+cvdb = { path = ".", features = ["fake-server"] }
 
 [lints.rust]
 unsafe_code = "forbid"
