@@ -29,6 +29,8 @@ pub enum Event {
 /// How long a connection must have lasted before the backoff starts over: a relay that
 /// accepts and then closes must not be retried every second (each attempt is a billed request).
 pub const STABLE_AFTER: Duration = Duration::from_secs(60);
+/// Bad closes in a row on one relay before the walker moves to the next (the browser rule).
+pub const BAD_CLOSES_BEFORE_ADVANCE: u32 = 2;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Seconds to wait before attempt number `attempt` (0 = the first retry): 1, 2, 4 ...
@@ -253,16 +255,25 @@ fn run(
     pace: &dyn Pace,
 ) {
     let mut attempt: u32 = 0;
+    // The relay walker, the same rule as the browser's: stay on the current relay; move to the
+    // next (wrapping) when it cannot be opened, or after two bad closes in a row (a connection
+    // that ended before `STABLE_AFTER`). A connection that lasted resets to the first relay.
+    let mut start: usize = 0;
+    let mut active: usize = 0;
+    let mut bad_closes: u32 = 0;
     while !stop.load(Ordering::SeqCst) {
-        // The first relay that answers wins; the list is walked in order on every reconnect.
         let mut socket = None;
         let mut gone = 0;
         let mut last_gone = 404;
-        for base in relays {
+        for k in 0..relays.len() {
+            let i = (start + k) % relays.len();
+            let base = &relays[i];
             counts.bump(Kind::Upgrade);
             match connect(&ws_url(base, ws_id, device), stop) {
                 Ok(ws) => {
                     socket = Some(ws);
+                    active = i;
+                    start = i;
                     break;
                 }
                 Err(Connect::Gone(s)) => {
@@ -307,7 +318,14 @@ fn run(
             // closes is never retried back to back.
             if pace.now().saturating_sub(since) >= STABLE_AFTER {
                 attempt = 0;
+                bad_closes = 0;
+                start = 0;
                 continue;
+            }
+            bad_closes += 1;
+            if bad_closes >= BAD_CLOSES_BEFORE_ADVANCE && relays.len() > 1 {
+                start = (active + 1) % relays.len();
+                bad_closes = 0;
             }
         }
         pace.sleep(backoff(attempt, fastrand::f64()), stop);

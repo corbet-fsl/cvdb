@@ -618,6 +618,79 @@ fn must1_a_relay_that_accepts_then_closes_is_backed_off() {
     println!("relay accepts then closes: {upgrades} upgrades in {simulated:?} simulated");
 }
 
+/// A relay that completes the upgrade and stays open; counts accepted connections.
+fn steady_relay() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = n.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            if let Ok(ws) = tungstenite::accept(s) {
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let mut ws = ws;
+                    while ws.read().is_ok() {}
+                });
+            }
+        }
+    });
+    (port, n)
+}
+
+#[test]
+fn walker_moves_to_the_second_relay_after_two_bad_closes() {
+    let bad = upgrading_then_closing_relay();
+    let (good, good_n) = steady_relay();
+    let counts = cvdb::Counts::default();
+    let pace = Arc::new(SimPace(Mutex::default()));
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let live = Live::spawn_with(
+        vec![format!("http://127.0.0.1:{bad}"), format!("http://127.0.0.1:{good}")],
+        "abcdef".into(),
+        "dev".into(),
+        counts.clone(),
+        tx,
+        pace,
+    );
+    let start = std::time::Instant::now();
+    while good_n.load(Ordering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(8) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    live.stop();
+    assert_eq!(good_n.load(Ordering::SeqCst), 1, "settled on the fallback relay");
+    // bad, bad (two closes), then the good one: three upgrades, not an endless CF loop.
+    assert_eq!(counts.get(Kind::Upgrade), 3, "{}", counts.get(Kind::Upgrade));
+}
+
+#[test]
+fn walker_budget_with_both_relays_closing_stays_bounded() {
+    let a = upgrading_then_closing_relay();
+    let b = upgrading_then_closing_relay();
+    let counts = cvdb::Counts::default();
+    let pace = Arc::new(SimPace(Mutex::default()));
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let live = Live::spawn_with(
+        vec![format!("http://127.0.0.1:{a}"), format!("http://127.0.0.1:{b}")],
+        "abcdef".into(),
+        "dev".into(),
+        counts.clone(),
+        tx,
+        pace.clone(),
+    );
+    let start = std::time::Instant::now();
+    while *pace.0.lock().unwrap() < Duration::from_secs(600)
+        && start.elapsed() < Duration::from_secs(8)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    live.stop();
+    let upgrades = counts.get(Kind::Upgrade);
+    assert!(*pace.0.lock().unwrap() >= Duration::from_secs(600));
+    // Still one upgrade per backoff step: a second relay adds no attempts when the first accepts.
+    assert!(upgrades <= 19, "{upgrades} upgrades in ten simulated minutes");
+}
+
 #[test]
 fn s4_two_relays_that_both_answer_404_stop() {
     use std::io::{Read, Write};
