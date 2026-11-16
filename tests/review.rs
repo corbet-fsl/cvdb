@@ -787,6 +787,9 @@ fn note_426_is_reported_to_the_host_once() {
     assert_eq!(c.edit(&set_text("y")).unwrap(), EditOutcome::Queued);
     assert_eq!(c.take_events(), vec![HostEvent::Outdated]);
     assert!(c.take_events().is_empty());
+    // A later 426 in the same session is not reported again.
+    assert_eq!(c.edit(&set_text("z")).unwrap(), EditOutcome::Queued);
+    assert!(c.take_events().is_empty(), "once per session");
 }
 
 #[test]
@@ -827,6 +830,7 @@ fn note_existing_directory_and_files_are_tightened() {
 struct HeadServer {
     fake: Arc<Fake>,
     reads_ok: Arc<Mutex<bool>>,
+    reads_500: Arc<Mutex<bool>>,
     online: Arc<Mutex<bool>>,
 }
 
@@ -837,11 +841,18 @@ fn head_server(
     let head: Arc<Mutex<Vec<u8>>> = Arc::default();
     let reads_ok = Arc::new(Mutex::new(true));
     let online = Arc::new(Mutex::new(true));
+    let reads_500 = Arc::new(Mutex::new(false));
     let n = Arc::new(AtomicUsize::new(0));
-    let (h, ro, on) = (head.clone(), reads_ok.clone(), online.clone());
+    let (h, ro, on, r5) = (
+        head.clone(),
+        reads_ok.clone(),
+        online.clone(),
+        reads_500.clone(),
+    );
     let fake = Fake::new(move |r| match r.method.as_str() {
         "GET" if r.path.is_empty() => resp(200, &[], &ws_json("append")),
         "GET" if !*ro.lock().unwrap() && r.path.starts_with("sub/c") => Err(Error::Offline),
+        "GET" if *r5.lock().unwrap() && r.path.starts_with("sub/c") => resp(500, &[], b"boom"),
         "GET" if shadow_500 && r.path == "sub/jobs" => resp(500, &[], b"boom"),
         "GET" if r.path == "sub/cv-profile" => {
             let b = h.lock().unwrap().clone();
@@ -860,6 +871,7 @@ fn head_server(
     HeadServer {
         fake,
         reads_ok,
+        reads_500,
         online,
     }
 }
@@ -933,7 +945,7 @@ fn s4_a_failed_rebuild_leaves_the_document_and_is_gated() {
         c.edit(&base_op("base")).unwrap(),
         EditOutcome::Saved { .. }
     ));
-    *srv.reads_ok.lock().unwrap() = false;
+    *srv.reads_500.lock().unwrap() = true;
     assert!(matches!(
         c.edit(&add_bullet("a1")).unwrap(),
         EditOutcome::Rejected(_)
@@ -957,7 +969,7 @@ fn s4_a_failed_rebuild_leaves_the_document_and_is_gated() {
         before,
         "a failed reload is not retried within five minutes"
     );
-    *srv.reads_ok.lock().unwrap() = true;
+    *srv.reads_500.lock().unwrap() = false;
     clock.advance(Duration::from_secs(301));
     c.replay().unwrap();
     assert_eq!(
@@ -1021,4 +1033,190 @@ fn note_a_reapplied_no_op_reports_no_change() {
     *srv.online.lock().unwrap() = true;
     assert_eq!(c.edit(&set_text("same")).unwrap(), EditOutcome::NoChange);
     assert_eq!(c.queued(), 0);
+}
+
+// ======================= third review follow-up =======================================
+
+#[test]
+fn offline_does_not_hold_the_reload_off() {
+    let clock = Arc::new(ManualClock::default());
+    let srv = head_server(false, |i| {
+        if i == 1 {
+            refuse()
+        } else {
+            ok_json(r#"{"ok":true,"clock":1}"#)
+        }
+    });
+    let mut c = open_with(&tmp("offhold"), &srv.fake, clock).unwrap();
+    c.attach().unwrap();
+    assert!(matches!(
+        c.edit(&base_op("base")).unwrap(),
+        EditOutcome::Saved { .. }
+    ));
+    *srv.reads_ok.lock().unwrap() = false;
+    assert!(matches!(
+        c.edit(&add_bullet("a1")).unwrap(),
+        EditOutcome::Rejected(_)
+    ));
+    assert_eq!(c.edit(&add_bullet("b2")).unwrap(), EditOutcome::Queued);
+    // The network comes back: no five-minute wait, the next flush reloads and sends.
+    *srv.reads_ok.lock().unwrap() = true;
+    c.replay().unwrap();
+    assert_eq!(c.queued(), 0);
+}
+
+#[test]
+fn a_successful_probe_clears_the_reload_hold() {
+    let clock = Arc::new(ManualClock::default());
+    let srv = head_server(false, |i| {
+        if i == 1 {
+            refuse()
+        } else {
+            ok_json(r#"{"ok":true,"clock":1}"#)
+        }
+    });
+    let mut c = open_with(&tmp("probehold"), &srv.fake, clock).unwrap();
+    c.attach().unwrap();
+    assert!(matches!(
+        c.edit(&base_op("base")).unwrap(),
+        EditOutcome::Saved { .. }
+    ));
+    *srv.reads_500.lock().unwrap() = true;
+    assert!(matches!(
+        c.edit(&add_bullet("a1")).unwrap(),
+        EditOutcome::Rejected(_)
+    ));
+    assert_eq!(c.edit(&add_bullet("b2")).unwrap(), EditOutcome::Queued);
+    // The server answered 500: held off. Healthy again, and a probe that succeeds clears the hold.
+    *srv.reads_500.lock().unwrap() = false;
+    c.replay().unwrap();
+    assert_eq!(c.queued(), 1, "still held off");
+    c.detect_mode().unwrap();
+    c.replay().unwrap();
+    assert_eq!(c.queued(), 0);
+}
+
+#[test]
+fn s5_a_just_saved_write_whose_echo_is_outstanding_is_not_undone_into_nothing() {
+    let mut ws = Workspace::open(&[]).unwrap();
+    ws.apply(&base_op("Senior"), ActorClass::Human).unwrap();
+    let head = ws.take_outgoing().unwrap().remove(0).update;
+    let fake = Fake::new(move |r| match r.method.as_str() {
+        "GET" if r.path.is_empty() => resp(200, &[], &ws_json("legacy")),
+        "GET" if r.path == "sub/cv-profile" => resp(200, &[], &head),
+        "GET" => resp(200, &[], &[0, 0]),
+        _ => ok_json(r#"{"ok":true}"#),
+    });
+    let mut c = open_in(&tmp("s5echo"), &fake).unwrap();
+    c.attach().unwrap();
+    c.set_live(true); // the relay will deliver the server's bytes; none arrived yet
+    assert!(matches!(
+        c.edit(&set_text("Lead")).unwrap(),
+        EditOutcome::Saved { .. }
+    ));
+    // The user reverts before the echo arrives: the local document still says Senior.
+    let out = c.edit(&set_text("Senior")).unwrap();
+    assert!(matches!(out, EditOutcome::Saved { .. }), "{out:?}");
+    let sent: Vec<String> = fake
+        .posts()
+        .iter()
+        .filter_map(|r| {
+            serde_json::from_slice::<Value>(&r.body).ok()?["op"]["patch"]["data"]["text"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(sent, ["Lead", "Senior"]);
+}
+
+#[test]
+fn s5_append_mode_with_server_applied_entries_queued_joins_them() {
+    let mode = Arc::new(Mutex::new("legacy"));
+    let writes = Arc::new(Mutex::new(false));
+    let (m, w) = (mode.clone(), writes.clone());
+    let fake = Fake::new(move |r| match r.method.as_str() {
+        "GET" if r.path.is_empty() => resp(200, &[], &ws_json(*m.lock().unwrap())),
+        "GET" => resp(200, &[], &[0, 0]),
+        _ if *w.lock().unwrap() => ok_json(r#"{"ok":true,"clock":1}"#),
+        _ => Err(Error::Offline),
+    });
+    let clock = Arc::new(ManualClock::default());
+    let mut c = open_with(&tmp("s5ops"), &fake, clock.clone()).unwrap();
+    c.attach().unwrap();
+    assert_eq!(c.edit(&base_op("one")).unwrap(), EditOutcome::Queued); // /ops entry, offline
+    *mode.lock().unwrap() = "append";
+    clock.advance(Duration::from_secs(301));
+    assert_eq!(c.edit(&base_op("two")).unwrap(), EditOutcome::Queued);
+    assert_eq!(
+        c.mode(),
+        Some(Mode::Append),
+        "the probe noticed the flip back"
+    );
+    *writes.lock().unwrap() = true;
+    c.replay().unwrap();
+    let paths: Vec<String> = fake.posts().iter().map(|r| r.path.clone()).collect();
+    assert!(
+        paths.iter().all(|p| p == "ops"),
+        "both go the same way, in order: {paths:?}"
+    );
+    assert_eq!(c.queued(), 0);
+}
+
+#[test]
+fn reapply_stamps_ids_when_the_reload_finally_allows_it() {
+    // The server's document has `root.item`; the client's stale one does not.
+    let mut w1 = Workspace::open(&[]).unwrap();
+    w1.apply(&base_op("base"), ActorClass::Human).unwrap();
+    let head1 = w1.take_outgoing().unwrap().remove(0).update;
+    let tree2 = json!({"kind": "cv_profile.replace", "lang": "en", "tree": node("root", "cv-root", json!({}),
+        vec![node("item", "list-item", json!({"heading": "H"}), vec![node("b1", "bullet", json!({"text": "base"}), vec![])])])});
+    let mut w2 = Workspace::open(&[]).unwrap();
+    w2.apply(&tree2, ActorClass::Human).unwrap();
+    let head2 = w2.take_outgoing().unwrap().remove(0).update;
+    let head: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(head1));
+    let reads_ok = Arc::new(Mutex::new(true));
+    let n = Arc::new(AtomicUsize::new(0));
+    let (h, ro, nn) = (head.clone(), reads_ok.clone(), n.clone());
+    let fake = Fake::new(move |r| match r.method.as_str() {
+        "GET" if r.path.is_empty() => resp(200, &[], &ws_json("append")),
+        "GET" if !*ro.lock().unwrap() && r.path.starts_with("sub/c") => Err(Error::Offline),
+        "GET" if r.path == "sub/cv-profile" => resp(200, &[], &h.lock().unwrap().clone()),
+        "GET" => resp(200, &[], &[0, 0]),
+        _ => {
+            if nn.fetch_add(1, Ordering::SeqCst) == 0 {
+                refuse()
+            } else {
+                ok_json(r#"{"ok":true,"clock":1}"#)
+            }
+        }
+    });
+    let mut c = open_in(&tmp("restamp"), &fake).unwrap();
+    c.attach().unwrap();
+    *reads_ok.lock().unwrap() = false;
+    // A is refused and the reload cannot happen; B is born a Reapply entry against the stale document.
+    assert!(matches!(
+        c.edit(&set_text("A")).unwrap(),
+        EditOutcome::Rejected(_)
+    ));
+    let under_item = json!({"kind": "node.create", "branch_path": "cv_profile.en", "parent_path": "root.item",
+        "node": {"kind": "bullet", "tier": "HYBRID", "data": {"text": "new"}, "selection": {"active": []}, "children": []}});
+    assert_eq!(c.edit(&under_item).unwrap(), EditOutcome::Queued);
+    *head.lock().unwrap() = head2;
+    *reads_ok.lock().unwrap() = true;
+    c.replay().unwrap();
+    assert_eq!(c.queued(), 0);
+    let sent: Value = serde_json::from_slice(&fake.posts().last().unwrap().body).unwrap();
+    let id = sent["op"]["node"]["id"]
+        .as_str()
+        .expect("the stored envelope carries the stamped id");
+    let item = c
+        .view(SubDoc::CvProfile, "cv_profile.en", "root.item")
+        .unwrap();
+    assert!(
+        item["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"] == id)
+    );
 }

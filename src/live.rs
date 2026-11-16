@@ -181,7 +181,7 @@ type Socket = WebSocket<MaybeTlsStream<std::net::TcpStream>>;
 /// TCP connect with a timeout and keepalive (kernel probes, no billed message), then the
 /// WebSocket handshake under a read/write timeout, with frame limits just above the cap that
 /// `relay_update` enforces, so a link holder cannot make every client buffer 64 MiB.
-fn connect(url: &str) -> std::result::Result<Socket, Connect> {
+fn connect(url: &str, stop: &AtomicBool) -> std::result::Result<Socket, Connect> {
     use std::net::ToSocketAddrs;
     let mut req = url.into_client_request().map_err(|_| Connect::Retry)?;
     req.headers_mut()
@@ -195,11 +195,20 @@ fn connect(url: &str) -> std::result::Result<Socket, Connect> {
         } else {
             80
         });
+    let deadline = std::time::Instant::now() + CONNECT_TIMEOUT;
     // Every resolved address is tried (a broken IPv6 route must not hide a working IPv4 one).
     let stream = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|_| Connect::Retry)?
-        .find_map(|a| std::net::TcpStream::connect_timeout(&a, CONNECT_TIMEOUT).ok())
+        .find_map(|a| {
+            // One overall deadline for all addresses, and the stop flag between them: stop()
+            // and Drop never wait for N connect timeouts.
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if stop.load(Ordering::SeqCst) || left.is_zero() {
+                return None;
+            }
+            std::net::TcpStream::connect_timeout(&a, left).ok()
+        })
         .ok_or(Connect::Retry)?;
     let _ = stream.set_nodelay(true);
     let ka = socket2::TcpKeepalive::new()
@@ -251,7 +260,7 @@ fn run(
         let mut last_gone = 404;
         for base in relays {
             counts.bump(Kind::Upgrade);
-            match connect(&ws_url(base, ws_id, device)) {
+            match connect(&ws_url(base, ws_id, device), stop) {
                 Ok(ws) => {
                     socket = Some(ws);
                     break;

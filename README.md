@@ -41,12 +41,15 @@ the five-minute probe.
   installs a logger must keep the `tungstenite` and `ureq` log targets at `info` or below. cvdb itself
   logs nothing and its errors never carry a URL.
 * **One instance per directory.** `Cvdb::open` takes an exclusive lock on `cfg.dir/lock` and refuses a
-  second instance (`Error::Locked`). The directory is 0700, every file 0600.
+  second instance (`Error::Locked`). The directory is 0700, every file 0600 (existing ones are tightened on
+  open, best effort). The lock is an `flock`: **keep the directory on a local filesystem**. On NFS it is
+  emulated with POSIX locks, a second open in the same process is not refused, and a dead client's lock can
+  outlive it.
 * **Queue behaviour.** Entries are sent strictly in order and an edit queues behind older ones. Only the
   API's own refusals (JSON `{"error": ...}` with status 400 or 422) park an entry; a 426 (catalog
   mismatch), an edge page or any other answer keeps it queued. A parked append entry makes the later
   ones derive their bytes again against the reloaded document.
-* **Outdated client.** A 426 from the server (op catalog mismatch) keeps entries queued and is reported once
+* **Outdated client.** A 426 from the server (op catalog mismatch) keeps entries queued and is reported once per session
   through `Cvdb::take_events()` as `HostEvent::Outdated`.
 * **Frames.** Relay and tail frames are capped at 1 MiB, the stored head at 32 MiB (it is a whole state).
   WebSocket messages are limited to the same cap plus 64 bytes.

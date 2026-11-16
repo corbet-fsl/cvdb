@@ -100,7 +100,8 @@ pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
         .mode(0o700)
         .create(dir)?;
     // An existing directory keeps its old mode otherwise.
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    // Best effort: a directory owned by someone else or on vfat/CIFS refuses a chmod.
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     Ok(())
 }
 

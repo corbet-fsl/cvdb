@@ -224,6 +224,7 @@ enum Sent {
     Flipped,
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent state flags
 pub struct Cvdb {
     link: Link,
     cfg: Config,
@@ -246,6 +247,9 @@ pub struct Cvdb {
     noops: BTreeSet<String>,
     rebuild_failed_at: Option<Duration>,
     rebuilt_this_flush: bool,
+    outdated_reported: bool,
+    /// Sub-documents with a just-saved server-applied write whose bytes have not come back yet.
+    unechoed: BTreeSet<SubDoc>,
 }
 
 /// Something the host should tell the user, reported once.
@@ -391,6 +395,8 @@ impl Cvdb {
             noops: BTreeSet::new(),
             rebuild_failed_at: None,
             rebuilt_this_flush: false,
+            outdated_reported: false,
+            unechoed: BTreeSet::new(),
         })
     }
 
@@ -509,6 +515,8 @@ impl Cvdb {
             // A server that does not name a write path is the legacy one.
             _ => Mode::Legacy,
         };
+        // The network is back: a held-off reload may be tried again.
+        self.rebuild_failed_at = None;
         let was = self.state.mode;
         self.state.mode = Some(mode);
         if mode == Mode::Legacy && was != Some(Mode::Legacy) {
@@ -575,6 +583,7 @@ impl Cvdb {
         }
         write_atomic(&cache_path(&self.cfg.dir, sub), &bytes)?;
         self.state.etags.insert(sub.as_str().to_owned(), etag);
+        self.unechoed.remove(&sub);
         self.state.save(&self.cfg.dir)
     }
 
@@ -636,6 +645,7 @@ impl Cvdb {
             self.state.etags.insert(sub.as_str().to_owned(), etag);
         }
         self.state.save(&self.cfg.dir)?;
+        self.unechoed.clear();
         self.load_shadows();
         Ok(())
     }
@@ -649,6 +659,9 @@ impl Cvdb {
             .run(move |ws| ws.receive(&bytes, None))?
             .map_err(|e| Error::Engine(e.to_string()))?;
         self.resync_wanted |= applied.resync;
+        for (sub, _) in &applied.changed {
+            self.unechoed.remove(sub);
+        }
         // A failed resync (offline, a bad answer) never fails the receive: the flag stays
         // raised and the next attempt waits for the five-minute gate again.
         let _ = self.maybe_resync();
@@ -703,6 +716,13 @@ impl Cvdb {
         let op_id = op["opId"].as_str().unwrap_or_default().to_owned();
         let derive_later = self.needs_rebuild();
         let nothing_pending = self.outbox.pending().is_empty();
+        // Server-applied entries still queued after a flip back to append: the local document
+        // does not hold them, so this edit joins them (same path, same order).
+        let ops_queued = self
+            .outbox
+            .pending()
+            .iter()
+            .any(|e| e.kind == EntryKind::Ops);
         let prepared = self.prepare(&op);
         let entry = match (mode, prepared) {
             (Mode::Append, prepared) if derive_later => Entry {
@@ -710,6 +730,12 @@ impl Cvdb {
                 kind: EntryKind::Reapply,
                 // Stamped when the stale document still allows it; the raw op otherwise.
                 op: prepared.map_or(op, |p| p.envelope),
+                updates: BTreeMap::new(),
+            },
+            (Mode::Append, prepared) if ops_queued => Entry {
+                op_id: op_id.clone(),
+                kind: EntryKind::Ops,
+                op: prepared?.envelope,
                 updates: BTreeMap::new(),
             },
             (Mode::Append, prepared) => {
@@ -739,9 +765,10 @@ impl Cvdb {
             (Mode::Legacy, prepared) => {
                 // Never applied locally: the server's canonical bytes come back through receive.
                 let prepared = prepared?;
-                // The local document never holds the queued `/ops` entries, so "no change" is
-                // only knowable when nothing is queued (undoing a queued edit is a real edit).
-                if prepared.would_change.is_empty() && nothing_pending {
+                // The local document never holds the queued `/ops` entries, nor a just-saved
+                // one whose bytes have not come back, so "no change" is only knowable when
+                // nothing is queued and no echo is outstanding (undoing such an edit is real).
+                if prepared.would_change.is_empty() && nothing_pending && self.unechoed.is_empty() {
                     return Ok(EditOutcome::NoChange);
                 }
                 Entry {
@@ -838,7 +865,8 @@ impl Cvdb {
             // The server runs its catalog check first: this client is outdated. The entry
             // stays queued; the host is told once.
             426 => {
-                if !self.events.contains(&HostEvent::Outdated) {
+                if !self.outdated_reported {
+                    self.outdated_reported = true;
                     self.events.push(HostEvent::Outdated);
                 }
                 Ok(Sent::Stay)
@@ -928,7 +956,9 @@ impl Cvdb {
     /// the canonical bytes arrive (one request per touched sub-document, once per flush).
     fn refresh_touched(&mut self) -> Result<()> {
         if self.live || self.touched.is_empty() || self.needs_rebuild() {
-            self.touched.clear();
+            // The saved write's bytes arrive later (live frame, next load or reload).
+            let touched = std::mem::take(&mut self.touched);
+            self.unechoed.extend(touched);
             return Ok(());
         }
         for sub in std::mem::take(&mut self.touched) {
@@ -1001,6 +1031,8 @@ impl Cvdb {
         match self.rebuild() {
             Ok(()) => self.rebuild_failed_at = None,
             Err(e @ (Error::Engine(_) | Error::EngineStopped | Error::Io(_))) => return Err(e),
+            // No answer at all: nothing to hold off from (one try per flush, one request).
+            Err(Error::Offline) => return Ok(()),
             Err(_) => {
                 self.rebuild_failed_at = Some(now);
                 return Ok(());
@@ -1024,6 +1056,12 @@ impl Cvdb {
                 entries[i].kind = EntryKind::Ops;
                 i += 1;
                 continue;
+            }
+            // Stamp the ids the engine would generate into the stored envelope before the
+            // apply, so a later conversion or re-derive mints the same ones (an op that only
+            // fits the reloaded document could not be stamped when it was queued).
+            if let Ok(p) = self.prepare(&entries[i].op) {
+                entries[i].op = p.envelope;
             }
             let op = entries[i].op.clone();
             match self.apply_local(&op) {
