@@ -13,7 +13,7 @@ pub mod link;
 pub mod live;
 pub mod outbox;
 
-pub use client::{Clock, Config, Cvdb, EditOutcome, Mode, SystemClock};
+pub use client::{Clock, Config, Cvdb, EditOutcome, HostEvent, Mode, SystemClock};
 pub use error::Error;
 pub use http::{Counts, Http, Kind, UreqHttp};
 pub use link::Link;

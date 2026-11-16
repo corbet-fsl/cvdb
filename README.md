@@ -46,6 +46,8 @@ the five-minute probe.
   API's own refusals (JSON `{"error": ...}` with status 400 or 422) park an entry; a 426 (catalog
   mismatch), an edge page or any other answer keeps it queued. A parked append entry makes the later
   ones derive their bytes again against the reloaded document.
+* **Outdated client.** A 426 from the server (op catalog mismatch) keeps entries queued and is reported once
+  through `Cvdb::take_events()` as `HostEvent::Outdated`.
 * **Frames.** Relay and tail frames are capped at 1 MiB, the stored head at 32 MiB (it is a whole state).
   WebSocket messages are limited to the same cap plus 64 bytes.
 * **Shadows.** `attach` loads the five non-profile sub-documents once as routing shadows (5 reads), so a

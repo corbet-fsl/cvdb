@@ -1,7 +1,9 @@
 //! Regression tests for the Opus review of 139bba6: each one fails without its fix.
 use cvdb::client::Config;
 use cvdb::http::Response;
-use cvdb::{Clock, Cvdb, EditOutcome, Error, Event, Http, Kind, Link, Live, Mode, SystemClock};
+use cvdb::{
+    Clock, Cvdb, EditOutcome, Error, Event, HostEvent, Http, Kind, Link, Live, Mode, SystemClock,
+};
 use cvws::{ActorClass, SubDoc, Workspace};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -110,13 +112,31 @@ fn tmp(tag: &str) -> PathBuf {
 }
 
 fn open_in(dir: &Path, http: &Arc<Fake>) -> Result<Cvdb, Error> {
+    open_with(dir, http, Arc::new(SystemClock::default()))
+}
+
+fn open_with(dir: &Path, http: &Arc<Fake>, clock: Arc<dyn Clock>) -> Result<Cvdb, Error> {
     let cfg = Config {
         api_base: "http://127.0.0.1:9".into(),
         relays: vec![],
         dir: dir.to_owned(),
     };
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
     Cvdb::open(Link::parse(SECRET).unwrap(), cfg, http.clone(), clock)
+}
+
+#[derive(Default)]
+struct ManualClock(Mutex<Duration>);
+
+impl ManualClock {
+    fn advance(&self, d: Duration) {
+        *self.0.lock().unwrap() += d;
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Duration {
+        *self.0.lock().unwrap()
+    }
 }
 
 fn node(id: &str, kind: &str, data: Value, ch: Vec<Value>) -> Value {
@@ -292,26 +312,25 @@ fn m2_edits_are_sent_in_order_behind_a_queued_one() {
 
 #[test]
 fn m3_unreadable_outbox_is_never_replaced_by_an_empty_one() {
-    use std::os::unix::fs::PermissionsExt;
     let fake = server("append", |_| Err(Error::Offline));
     let dir = tmp("m3");
     let mut c = open_in(&dir, &fake).unwrap();
     c.attach().unwrap();
     assert_eq!(c.edit(&base_op("keep me")).unwrap(), EditOutcome::Queued);
     drop(c);
+    // A read error that is not NotFound (here EISDIR: open() also repairs bad modes, so a
+    // chmod would no longer make a file unreadable).
     let log = dir.join("outbox.log");
-    let before = std::fs::read(&log).unwrap();
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let saved = dir.join("outbox.saved");
+    std::fs::rename(&log, &saved).unwrap();
+    std::fs::create_dir(&log).unwrap();
     assert!(
         open_in(&dir, &fake).is_err(),
         "open must fail, not start empty"
     );
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(
-        std::fs::read(&log).unwrap(),
-        before,
-        "the outbox is untouched"
-    );
+    assert!(log.is_dir(), "nothing was replaced");
+    std::fs::remove_dir(&log).unwrap();
+    std::fs::rename(&saved, &log).unwrap();
     assert_eq!(open_in(&dir, &fake).unwrap().queued(), 1);
 }
 
@@ -464,20 +483,6 @@ fn n1_directory_and_parked_log_are_private() {
 // ---- S4: the live relay ---------------------------------------------------------------
 
 #[test]
-fn s4_backoff_starts_over_only_after_a_stable_connection() {
-    use cvdb::live::{STABLE_AFTER, next_attempt};
-    assert_eq!(next_attempt(5, Duration::from_secs(1)), 5);
-    assert_eq!(
-        next_attempt(
-            5,
-            STABLE_AFTER.checked_sub(Duration::from_millis(1)).unwrap()
-        ),
-        5
-    );
-    assert_eq!(next_attempt(5, STABLE_AFTER), 0);
-}
-
-#[test]
 fn s4_a_4xx_upgrade_stops_the_thread_after_one_attempt() {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -546,4 +551,474 @@ fn only_human_class_is_ever_sent() {
         assert!(v.get("agentId").is_none());
     }
     let _ = ActorClass::Human;
+}
+
+// ======================= second review ===============================================
+
+/// Virtual time for the reconnect loop: a sleep advances the clock and returns at once.
+struct SimPace(Mutex<Duration>);
+
+impl cvdb::live::Pace for SimPace {
+    fn now(&self) -> Duration {
+        *self.0.lock().unwrap()
+    }
+    fn sleep(&self, d: Duration, stop: &std::sync::atomic::AtomicBool) {
+        if !stop.load(Ordering::SeqCst) {
+            *self.0.lock().unwrap() += d;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+fn upgrading_then_closing_relay() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            // Complete the WebSocket upgrade, then drop the connection.
+            drop(tungstenite::accept(s));
+        }
+    });
+    port
+}
+
+#[test]
+fn must1_a_relay_that_accepts_then_closes_is_backed_off() {
+    let port = upgrading_then_closing_relay();
+    let counts = cvdb::Counts::default();
+    let pace = Arc::new(SimPace(Mutex::default()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let live = Live::spawn_with(
+        vec![format!("http://127.0.0.1:{port}")],
+        "abcdef".into(),
+        "dev".into(),
+        counts.clone(),
+        tx,
+        pace.clone(),
+    );
+    // Ten simulated minutes (or eight real seconds, which only a hot loop would run into).
+    let start = std::time::Instant::now();
+    while *pace.0.lock().unwrap() < Duration::from_secs(600)
+        && start.elapsed() < Duration::from_secs(8)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    live.stop();
+    let simulated = *pace.0.lock().unwrap();
+    let upgrades = counts.get(Kind::Upgrade);
+    assert!(
+        simulated >= Duration::from_secs(600),
+        "backoff delays ran: {simulated:?}, {upgrades} upgrades"
+    );
+    assert!(
+        upgrades <= 19,
+        "{upgrades} upgrades in ten simulated minutes"
+    );
+    assert!(rx.try_iter().any(|e| e == Event::Connected));
+    println!("relay accepts then closes: {upgrades} upgrades in {simulated:?} simulated");
+}
+
+#[test]
+fn s4_two_relays_that_both_answer_404_stop() {
+    use std::io::{Read, Write};
+    let relay = || {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut s = s;
+                let mut b = [0u8; 1024];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    };
+    let counts = cvdb::Counts::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _live = Live::spawn(
+        vec![relay(), relay()],
+        "abcdef".into(),
+        "dev".into(),
+        counts.clone(),
+        tx,
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        Event::Gone(404)
+    );
+    std::thread::sleep(Duration::from_millis(1200));
+    assert_eq!(
+        counts.get(Kind::Upgrade),
+        2,
+        "one walk of both relays, then it stopped"
+    );
+}
+
+#[test]
+fn live_stop_never_blocks() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let _c = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(15));
+    });
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let live = Live::spawn(
+        vec![format!("http://127.0.0.1:{port}")],
+        "abcdef".into(),
+        "dev".into(),
+        cvdb::Counts::default(),
+        tx,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let t = std::time::Instant::now();
+    live.stop();
+    assert!(t.elapsed() < Duration::from_secs(1));
+}
+
+fn bullet_without_id(text: &str) -> Value {
+    json!({"kind": "node.create", "branch_path": "cv_profile.en", "parent_path": "root",
+        "node": {"kind": "bullet", "tier": "HYBRID", "data": {"text": text}, "selection": {"active": []}, "children": []}})
+}
+
+#[test]
+fn s3_a_crash_between_park_and_rewrite_never_resends_stale_bytes() {
+    let online = Arc::new(Mutex::new(false));
+    let on = online.clone();
+    let first = Arc::new(AtomicUsize::new(0));
+    let fi = first.clone();
+    let fake = Fake::new(move |r| match r.method.as_str() {
+        "GET" if r.path.is_empty() => resp(200, &[], &ws_json("append")),
+        "GET" => resp(200, &[], &[0, 0]),
+        _ if !*on.lock().unwrap() => Err(Error::Offline),
+        _ if fi.fetch_add(1, Ordering::SeqCst) == 0 => {
+            resp(422, &[], br#"{"error":"op_apply_failed: no"}"#)
+        }
+        _ => ok_json(r#"{"ok":true,"clock":1}"#),
+    });
+    let dir = tmp("s3crash");
+    let mut c = open_in(&dir, &fake).unwrap();
+    c.attach().unwrap();
+    c.edit(&base_op("A")).unwrap(); // queued (offline)
+    c.edit(&add_bullet("b2")).unwrap(); // queued behind it, bytes depend on A
+    let a_id = serde_json::from_slice::<Value>(&fake.posts()[0].body).unwrap()["opId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    *online.lock().unwrap() = true;
+    c.inject_outbox_rewrite_failure(true);
+    assert!(
+        c.replay().is_err(),
+        "the crash window: parked line written, rewrite failed"
+    );
+    drop(c);
+    let before = fake.posts().len();
+    fake.log.lock().unwrap().clear();
+    first.store(1, Ordering::SeqCst); // everything the server sees from now on is accepted
+    let mut c = open_in(&dir, &fake).unwrap();
+    c.attach().unwrap();
+    let ids: Vec<String> = fake
+        .posts()
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<Value>(&r.body).unwrap()["opId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(
+        ids.first(),
+        Some(&a_id),
+        "A is sent again before anything that depends on it ({before} earlier posts)"
+    );
+}
+
+#[test]
+fn s5_a_legacy_undo_of_a_queued_edit_is_still_queued() {
+    // The server holds "Senior"; offline the user changes it to Lead and back.
+    let mut ws = Workspace::open(&[]).unwrap();
+    ws.apply(&base_op("Senior"), ActorClass::Human).unwrap();
+    let head = ws.take_outgoing().unwrap().remove(0).update;
+    let online = Arc::new(Mutex::new(false));
+    let on = online.clone();
+    let fake = Fake::new(move |r| match r.method.as_str() {
+        "GET" if r.path.is_empty() => resp(200, &[], &ws_json("legacy")),
+        "GET" if r.path == "sub/cv-profile" => resp(200, &[], &head),
+        "GET" => resp(200, &[], &[0, 0]),
+        _ if *on.lock().unwrap() => ok_json(r#"{"ok":true}"#),
+        _ => Err(Error::Offline),
+    });
+    let mut c = open_in(&tmp("s5"), &fake).unwrap();
+    c.attach().unwrap();
+    assert_eq!(c.edit(&set_text("Lead")).unwrap(), EditOutcome::Queued);
+    assert_eq!(
+        c.edit(&set_text("Senior")).unwrap(),
+        EditOutcome::Queued,
+        "the undo is a real edit"
+    );
+    assert_eq!(c.queued(), 2);
+    *online.lock().unwrap() = true;
+    c.replay().unwrap();
+    let texts: Vec<String> = fake
+        .posts()
+        .iter()
+        .filter(|r| r.path == "ops")
+        .filter_map(|r| {
+            serde_json::from_slice::<Value>(&r.body).ok()?["op"]["patch"]["data"]["text"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        texts.last().map(String::as_str),
+        Some("Senior"),
+        "the last committed value is the last one sent: {texts:?}"
+    );
+}
+
+#[test]
+fn note_426_is_reported_to_the_host_once() {
+    let fake = server("append", |_| resp(426, &[], b"please reload"));
+    let mut c = open_in(&tmp("n426"), &fake).unwrap();
+    c.attach().unwrap();
+    assert_eq!(c.edit(&base_op("x")).unwrap(), EditOutcome::Queued);
+    assert_eq!(c.edit(&set_text("y")).unwrap(), EditOutcome::Queued);
+    assert_eq!(c.take_events(), vec![HostEvent::Outdated]);
+    assert!(c.take_events().is_empty());
+}
+
+#[test]
+fn note_a_409_on_an_ops_entry_is_not_a_flip() {
+    let fake = server("legacy", |_| {
+        resp(409, &[], br#"{"error":"not_on_append_path: x"}"#)
+    });
+    let mut c = open_in(&tmp("n409"), &fake).unwrap();
+    c.attach().unwrap();
+    let t = std::time::Instant::now();
+    assert_eq!(c.edit(&base_op("x")).unwrap(), EditOutcome::Queued);
+    assert!(t.elapsed() < Duration::from_secs(2), "no spin");
+    assert_eq!(fake.posts().len(), 1, "sent once, not looped");
+    assert_eq!(c.mode(), Some(Mode::Legacy));
+}
+
+#[test]
+fn note_existing_directory_and_files_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = server("append", |_| Err(Error::Offline));
+    let dir = tmp("ntight");
+    std::fs::create_dir_all(dir.join("cache")).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(dir.join("parked.log"), b"x\n").unwrap();
+    std::fs::set_permissions(
+        dir.join("parked.log"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let _c = open_in(&dir, &fake).unwrap();
+    let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(dir.clone()), 0o700);
+    assert_eq!(mode(dir.join("parked.log")), 0o600);
+}
+
+/// A server in append mode that keeps the bytes of the first append as the stored head of
+/// `cv-profile` (what a reload reads), with switches for failing reads and a failing shadow.
+struct HeadServer {
+    fake: Arc<Fake>,
+    reads_ok: Arc<Mutex<bool>>,
+    online: Arc<Mutex<bool>>,
+}
+
+fn head_server(
+    shadow_500: bool,
+    write: impl Fn(usize) -> Result<Response, Error> + Send + Sync + 'static,
+) -> HeadServer {
+    let head: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let reads_ok = Arc::new(Mutex::new(true));
+    let online = Arc::new(Mutex::new(true));
+    let n = Arc::new(AtomicUsize::new(0));
+    let (h, ro, on) = (head.clone(), reads_ok.clone(), online.clone());
+    let fake = Fake::new(move |r| match r.method.as_str() {
+        "GET" if r.path.is_empty() => resp(200, &[], &ws_json("append")),
+        "GET" if !*ro.lock().unwrap() && r.path.starts_with("sub/c") => Err(Error::Offline),
+        "GET" if shadow_500 && r.path == "sub/jobs" => resp(500, &[], b"boom"),
+        "GET" if r.path == "sub/cv-profile" => {
+            let b = h.lock().unwrap().clone();
+            resp(200, &[], if b.is_empty() { &[0, 0] } else { &b })
+        }
+        "GET" => resp(200, &[], &[0, 0]),
+        _ if !*on.lock().unwrap() => Err(Error::Offline),
+        _ => {
+            let i = n.fetch_add(1, Ordering::SeqCst);
+            if i == 0 {
+                *h.lock().unwrap() = updates_of(&r.body).remove(0);
+            }
+            write(i)
+        }
+    });
+    HeadServer {
+        fake,
+        reads_ok,
+        online,
+    }
+}
+
+fn refuse() -> Result<Response, Error> {
+    resp(422, &[], br#"{"error":"op_apply_failed: no"}"#)
+}
+
+#[test]
+fn must2_rederived_entries_keep_the_stamped_ids() {
+    // Online: the base is saved. Offline: A (will be refused), B creates a bullet without an
+    // id, C edits that bullet by the id the engine minted.
+    let srv = head_server(false, |i| {
+        if i == 1 {
+            refuse()
+        } else {
+            ok_json(r#"{"ok":true,"clock":1}"#)
+        }
+    });
+    let mut c = open_in(&tmp("must2"), &srv.fake).unwrap();
+    c.attach().unwrap();
+    assert!(matches!(
+        c.edit(&base_op("base")).unwrap(),
+        EditOutcome::Saved { .. }
+    ));
+    *srv.online.lock().unwrap() = false;
+    assert_eq!(c.edit(&set_text("A")).unwrap(), EditOutcome::Queued);
+    assert_eq!(
+        c.edit(&bullet_without_id("new")).unwrap(),
+        EditOutcome::Queued
+    );
+    let root = c.view(SubDoc::CvProfile, "cv_profile.en", "root").unwrap();
+    let id = root["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["id"].as_str())
+        .find(|i| *i != "b1")
+        .expect("an id was minted")
+        .to_owned();
+    let edit = json!({"kind": "node.update", "branch_path": "cv_profile.en",
+        "node_path": format!("root.{id}"), "patch": {"data": {"text": "typed"}}});
+    assert_eq!(c.edit(&edit).unwrap(), EditOutcome::Queued);
+    assert_eq!(c.queued(), 3);
+    *srv.online.lock().unwrap() = true;
+    c.replay().unwrap();
+    // A was refused; the create and the edit were derived again with the SAME id.
+    assert_eq!(c.queued(), 0);
+    let notices = c.take_notices();
+    assert_eq!(
+        notices.len(),
+        1,
+        "{notices:?}: only the refused entry is parked"
+    );
+    assert_eq!(text(&c, &format!("root.{id}")).as_deref(), Some("typed"));
+}
+
+#[test]
+fn s4_a_failed_rebuild_leaves_the_document_and_is_gated() {
+    let clock = Arc::new(ManualClock::default());
+    let srv = head_server(false, |i| {
+        if i == 1 {
+            refuse()
+        } else {
+            ok_json(r#"{"ok":true,"clock":1}"#)
+        }
+    });
+    let mut c = open_with(&tmp("s4rb"), &srv.fake, clock.clone()).unwrap();
+    c.attach().unwrap();
+    assert!(matches!(
+        c.edit(&base_op("base")).unwrap(),
+        EditOutcome::Saved { .. }
+    ));
+    *srv.reads_ok.lock().unwrap() = false;
+    assert!(matches!(
+        c.edit(&add_bullet("a1")).unwrap(),
+        EditOutcome::Rejected(_)
+    ));
+    // The reload cannot happen: the document the user sees is untouched, the next edit queues.
+    assert_eq!(text(&c, "root.b1").as_deref(), Some("base"), "view kept");
+    assert_eq!(c.edit(&add_bullet("b2")).unwrap(), EditOutcome::Queued);
+    let cv_reads = || {
+        srv.fake
+            .paths()
+            .iter()
+            .filter(|p| *p == "GET sub/cv-profile")
+            .count()
+    };
+    let before = cv_reads();
+    for _ in 0..5 {
+        c.replay().unwrap();
+    }
+    assert_eq!(
+        cv_reads(),
+        before,
+        "a failed reload is not retried within five minutes"
+    );
+    *srv.reads_ok.lock().unwrap() = true;
+    clock.advance(Duration::from_secs(301));
+    c.replay().unwrap();
+    assert_eq!(
+        c.queued(),
+        0,
+        "after the gate the reload succeeds and the entry is sent"
+    );
+    assert!(text(&c, "root.b2").is_some());
+}
+
+#[test]
+fn s4_a_failing_shadow_blocks_neither_attach_nor_edits() {
+    let srv = head_server(true, |i| {
+        if i == 1 {
+            refuse()
+        } else {
+            ok_json(r#"{"ok":true,"clock":1}"#)
+        }
+    });
+    let mut c = open_in(&tmp("s4sh"), &srv.fake).unwrap();
+    c.attach().expect("attach survives a failing shadow");
+    assert!(matches!(
+        c.edit(&base_op("base")).unwrap(),
+        EditOutcome::Saved { .. }
+    ));
+    assert!(matches!(
+        c.edit(&add_bullet("a1")).unwrap(),
+        EditOutcome::Rejected(_)
+    ));
+    let b = c.edit(&add_bullet("b2")).unwrap();
+    assert!(matches!(b, EditOutcome::Saved { .. }), "{b:?}");
+    let reads = srv
+        .fake
+        .paths()
+        .iter()
+        .filter(|p| p.starts_with("GET sub/"))
+        .count();
+    // attach: 2 + 5; one reload: 2 + 5. Nothing multiplies.
+    assert!(reads <= 14, "{reads} sub reads");
+}
+
+#[test]
+fn note_a_reapplied_no_op_reports_no_change() {
+    // Offline: A changes the text. Online, A is refused; B (made after A) sets the text back
+    // to what the server holds: after the reload it is a no-op.
+    let srv = head_server(false, |i| {
+        if i == 1 {
+            refuse()
+        } else {
+            ok_json(r#"{"ok":true,"clock":1}"#)
+        }
+    });
+    let mut c = open_in(&tmp("nnoop"), &srv.fake).unwrap();
+    c.attach().unwrap();
+    assert!(matches!(
+        c.edit(&base_op("same")).unwrap(),
+        EditOutcome::Saved { .. }
+    ));
+    *srv.online.lock().unwrap() = false;
+    assert_eq!(c.edit(&set_text("changed")).unwrap(), EditOutcome::Queued);
+    *srv.online.lock().unwrap() = true;
+    assert_eq!(c.edit(&set_text("same")).unwrap(), EditOutcome::NoChange);
+    assert_eq!(c.queued(), 0);
 }

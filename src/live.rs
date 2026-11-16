@@ -60,6 +60,24 @@ pub fn device_id(dir: &Path) -> String {
     id
 }
 
+/// Time and sleeping for the reconnect loop; injectable so tests can run ten minutes of
+/// backoff in milliseconds.
+pub trait Pace: Send + Sync {
+    fn now(&self) -> Duration;
+    fn sleep(&self, d: Duration, stop: &AtomicBool);
+}
+
+struct RealPace(std::time::Instant);
+
+impl Pace for RealPace {
+    fn now(&self) -> Duration {
+        self.0.elapsed()
+    }
+    fn sleep(&self, d: Duration, stop: &AtomicBool) {
+        sleep_unless_stopped(d, stop);
+    }
+}
+
 pub struct Live {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -99,17 +117,43 @@ impl Live {
         counts: Counts,
         tx: Sender<Event>,
     ) -> Self {
+        Self::spawn_with(
+            relays,
+            ws_id,
+            device,
+            counts,
+            tx,
+            Arc::new(RealPace(std::time::Instant::now())),
+        )
+    }
+
+    /// [`Live::spawn`] with an injected clock and sleeper.
+    pub fn spawn_with(
+        relays: Vec<String>,
+        ws_id: String,
+        device: String,
+        counts: Counts,
+        tx: Sender<Event>,
+        pace: Arc<dyn Pace>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let handle = std::thread::Builder::new()
             .name("cvdb-live".into())
-            .spawn(move || run(&relays, &ws_id, &device, &counts, &tx, &flag))
+            .spawn(move || run(&relays, &ws_id, &device, &counts, &tx, &flag, pace.as_ref()))
             .ok();
         Self { stop, handle }
     }
 
-    pub fn stop(&mut self) {
+    /// Ask the thread to end. Never blocks: it ends within a quarter second, or after its
+    /// connect timeout. [`Live::join`] waits for it.
+    pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop and wait for the thread.
+    pub fn join(mut self) {
+        self.stop();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -151,13 +195,12 @@ fn connect(url: &str) -> std::result::Result<Socket, Connect> {
         } else {
             80
         });
-    let addr = (host.as_str(), port)
+    // Every resolved address is tried (a broken IPv6 route must not hide a working IPv4 one).
+    let stream = (host.as_str(), port)
         .to_socket_addrs()
         .map_err(|_| Connect::Retry)?
-        .next()
+        .find_map(|a| std::net::TcpStream::connect_timeout(&a, CONNECT_TIMEOUT).ok())
         .ok_or(Connect::Retry)?;
-    let stream =
-        std::net::TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|_| Connect::Retry)?;
     let _ = stream.set_nodelay(true);
     let ka = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(30))
@@ -198,12 +241,14 @@ fn run(
     counts: &Counts,
     tx: &Sender<Event>,
     stop: &AtomicBool,
+    pace: &dyn Pace,
 ) {
     let mut attempt: u32 = 0;
     while !stop.load(Ordering::SeqCst) {
         // The first relay that answers wins; the list is walked in order on every reconnect.
         let mut socket = None;
-        let mut gone = None;
+        let mut gone = 0;
+        let mut last_gone = 404;
         for base in relays {
             counts.bump(Kind::Upgrade);
             match connect(&ws_url(base, ws_id, device)) {
@@ -211,16 +256,20 @@ fn run(
                     socket = Some(ws);
                     break;
                 }
-                Err(Connect::Gone(s)) => gone = Some(s),
+                Err(Connect::Gone(s)) => {
+                    gone += 1;
+                    last_gone = s;
+                }
                 Err(Connect::Retry) => {}
             }
         }
-        if socket.is_none() && gone.is_some_and(|_| relays.len() == 1) {
-            let _ = tx.send(Event::Gone(gone.unwrap_or(404)));
+        // Every relay answered 4xx: retrying cannot help.
+        if socket.is_none() && !relays.is_empty() && gone == relays.len() {
+            let _ = tx.send(Event::Gone(last_gone));
             return;
         }
         if let Some(mut ws) = socket {
-            let since = std::time::Instant::now();
+            let since = pace.now();
             let _ = tx.send(Event::Connected);
             while !stop.load(Ordering::SeqCst) {
                 match ws.read() {
@@ -244,25 +293,16 @@ fn run(
             }
             let _ = ws.close(None);
             let _ = tx.send(Event::Disconnected);
-            attempt = next_attempt(attempt, since.elapsed());
-            if attempt == 0 {
-                // a stable connection: the first retry is quick
+            // Only a connection that lasted starts the backoff over (and may reconnect at
+            // once). A short one falls through to the sleep: a relay that accepts and then
+            // closes is never retried back to back.
+            if pace.now().saturating_sub(since) >= STABLE_AFTER {
+                attempt = 0;
                 continue;
             }
         }
-        sleep_unless_stopped(backoff(attempt, fastrand::f64()), stop);
+        pace.sleep(backoff(attempt, fastrand::f64()), stop);
         attempt = attempt.saturating_add(1);
-    }
-}
-
-/// The backoff step after a connection that lasted `connected_for`: it starts over only
-/// after a stable one, so a relay that accepts and then closes is not hammered.
-#[must_use]
-pub fn next_attempt(attempt: u32, connected_for: Duration) -> u32 {
-    if connected_for >= STABLE_AFTER {
-        0
-    } else {
-        attempt
     }
 }
 

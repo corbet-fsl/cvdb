@@ -242,6 +242,18 @@ pub struct Cvdb {
     acked: BTreeMap<String, Option<u64>>,
     rejected: BTreeMap<String, String>,
     touched: BTreeSet<SubDoc>,
+    events: Vec<HostEvent>,
+    noops: BTreeSet<String>,
+    rebuild_failed_at: Option<Duration>,
+    rebuilt_this_flush: bool,
+}
+
+/// Something the host should tell the user, reported once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostEvent {
+    /// The server refused an op because this client's op catalog is out of date (426):
+    /// edits queue until the client is updated.
+    Outdated,
 }
 
 fn new_op_id() -> String {
@@ -328,6 +340,13 @@ impl Cvdb {
         create_private_dir(&cfg.dir)?;
         create_private_dir(&cfg.dir.join("cache"))?;
         let lock = lock_dir(&cfg.dir)?;
+        crate::link::tighten(&[
+            &cfg.dir.join("state.json"),
+            &cfg.dir.join("device"),
+            &cfg.dir.join("lock"),
+            &cache_path(&cfg.dir, SubDoc::CvProfile),
+            &cache_path(&cfg.dir, SubDoc::ClProfile),
+        ]);
         let outbox = Outbox::open(&cfg.dir)?;
         let mut state = State::load(&cfg.dir);
         let mut states = Vec::new();
@@ -368,6 +387,10 @@ impl Cvdb {
             acked: BTreeMap::new(),
             rejected: BTreeMap::new(),
             touched: BTreeSet::new(),
+            events: Vec::new(),
+            noops: BTreeSet::new(),
+            rebuild_failed_at: None,
+            rebuilt_this_flush: false,
         })
     }
 
@@ -458,7 +481,7 @@ impl Cvdb {
             for sub in SUB_DOCS {
                 self.load(sub)?;
             }
-            self.load_shadows()?;
+            self.load_shadows();
             let (sent, left) = self.replay()?;
             report.replayed = sent;
             report.left = left;
@@ -545,29 +568,7 @@ impl Cvdb {
             return Ok(());
         };
         let replace = replace || frames.first().is_some_and(|h| h.len() > frames::MAX_FRAME);
-        let result = self.engine.run(move |ws| {
-            let mut iter = frames.into_iter();
-            if replace && let Some(head) = iter.next() {
-                let other: Vec<(SubDoc, Vec<u8>)> = SUB_DOCS
-                    .iter()
-                    .filter(|s| **s != sub)
-                    .map(|s| (*s, ws.encode_state(*s)))
-                    .collect();
-                let mut states: Vec<(SubDoc, &[u8])> =
-                    other.iter().map(|(s, b)| (*s, b.as_slice())).collect();
-                states.push((sub, head.as_slice()));
-                *ws = Workspace::open(&states).map_err(|e| Error::Engine(e.to_string()))?;
-            }
-            let mut flagged = false;
-            for f in iter {
-                if let Ok(a) = ws.receive(&f, Some(sub)) {
-                    flagged |= a.resync;
-                }
-            }
-            flagged |= ws.take_resync();
-            Ok::<(bool, Vec<u8>), Error>((flagged, ws.encode_state(sub)))
-        })?;
-        let (flagged, bytes) = result?;
+        let (flagged, bytes) = apply_frames(&self.engine, sub, frames, replace)?;
         self.resync_wanted |= flagged;
         if replace {
             self.reapply_pending_bytes(Some(sub))?;
@@ -598,33 +599,45 @@ impl Cvdb {
     }
 
     /// Load the non-profile sub-documents as routing shadows, once per attach (5 reads).
-    /// Shadows are never persisted or synced; with them every relay frame is attributed
-    /// exactly, so a busy browser peer's `jobs` frames are not held and evicted into resyncs.
-    pub fn load_shadows(&mut self) -> Result<()> {
+    /// Best effort: shadows only sharpen frame routing, so a sub-document that fails is
+    /// skipped (and nothing else waits for it); a network failure ends the round.
+    pub fn load_shadows(&mut self) {
         for which in FOREIGN {
-            let Some((frames, _)) = self.fetch_sub(which.as_str(), false)? else {
-                continue;
-            };
-            self.engine.run(move |ws| {
-                for f in frames {
-                    ws.load_shadow(which, &f).ok();
+            match self.fetch_sub(which.as_str(), false) {
+                Ok(Some((frames, _))) => {
+                    let _ = self.engine.run(move |ws| {
+                        for f in frames {
+                            ws.load_shadow(which, &f).ok();
+                        }
+                    });
                 }
-            })?;
+                Ok(None) | Err(Error::Server(_) | Error::Protocol(_)) => {}
+                Err(_) => break,
+            }
         }
-        Ok(())
     }
 
-    /// Reload every sub-document from the server, discarding the local document.
+    /// Reload every profile sub-document from the server into a FRESH engine and swap it in
+    /// only when all of them arrived: a failure leaves the current document untouched.
     fn rebuild(&mut self) -> Result<()> {
+        let fresh = Engine::spawn(Vec::new())?;
+        let mut loaded = Vec::new();
         for sub in SUB_DOCS {
-            self.state.etags.remove(sub.as_str());
-            let _ = std::fs::remove_file(cache_path(&self.cfg.dir, sub));
+            let (frames, etag) = self
+                .fetch_sub(sub.as_str(), false)?
+                .ok_or_else(|| Error::Protocol("an unconditional read answered 304".into()))?;
+            let (flagged, bytes) = apply_frames(&fresh, sub, frames, true)?;
+            loaded.push((sub, etag, bytes, flagged));
         }
-        self.engine = Engine::spawn(Vec::new())?;
-        for sub in SUB_DOCS {
-            self.load_inner(sub, true)?;
+        self.engine = fresh;
+        for (sub, etag, bytes, flagged) in loaded {
+            self.resync_wanted |= flagged;
+            write_atomic(&cache_path(&self.cfg.dir, sub), &bytes)?;
+            self.state.etags.insert(sub.as_str().to_owned(), etag);
         }
-        self.load_shadows()
+        self.state.save(&self.cfg.dir)?;
+        self.load_shadows();
+        Ok(())
     }
 
     /// Take update bytes from the live relay. A raised resync flag leads to one reload of
@@ -667,6 +680,9 @@ impl Cvdb {
     /// One user action: a single op, or a `batch` of ops (one request for all of them).
     /// Call it once per committed field edit (blur or confirm), never per keystroke.
     /// An edit queues behind older queued entries and is sent after them, in order.
+    ///
+    /// The entry stores the checked envelope with the ids the engine generates (`prepare`),
+    /// so deriving it again after a reload, or sending it through `/ops`, keeps the same ids.
     pub fn edit(&mut self, op: &Value) -> Result<EditOutcome> {
         if self.state.mode == Some(Mode::Legacy) && self.probe_due() {
             // A flag flipped back to append is noticed here, at most every five minutes.
@@ -685,21 +701,20 @@ impl Cvdb {
             obj.insert("opId".into(), Value::String(new_op_id()));
         }
         let op_id = op["opId"].as_str().unwrap_or_default().to_owned();
-        let derive_later = self.state.rebuild
-            || self
-                .outbox
-                .pending()
-                .iter()
-                .any(|e| e.kind == EntryKind::Reapply);
-        let entry = match mode {
-            Mode::Append if derive_later => Entry {
+        let derive_later = self.needs_rebuild();
+        let nothing_pending = self.outbox.pending().is_empty();
+        let prepared = self.prepare(&op);
+        let entry = match (mode, prepared) {
+            (Mode::Append, prepared) if derive_later => Entry {
                 op_id: op_id.clone(),
                 kind: EntryKind::Reapply,
-                op,
+                // Stamped when the stale document still allows it; the raw op otherwise.
+                op: prepared.map_or(op, |p| p.envelope),
                 updates: BTreeMap::new(),
             },
-            Mode::Append => {
-                let outgoing = self.apply_local(&op)?;
+            (Mode::Append, prepared) => {
+                let envelope = prepared?.envelope;
+                let outgoing = self.apply_local(&envelope)?;
                 if outgoing.is_empty() {
                     return Ok(EditOutcome::NoChange);
                 }
@@ -710,7 +725,7 @@ impl Cvdb {
                 let entry = Entry {
                     op_id: op_id.clone(),
                     kind: EntryKind::Append,
-                    op,
+                    op: envelope,
                     updates,
                 };
                 if let Err(e) = self.outbox.append(&entry) {
@@ -721,14 +736,12 @@ impl Cvdb {
                 }
                 return self.finish_edit(&op_id);
             }
-            Mode::Legacy => {
+            (Mode::Legacy, prepared) => {
                 // Never applied locally: the server's canonical bytes come back through receive.
-                let o = op.clone();
-                let prepared = self
-                    .engine
-                    .run(move |ws| ws.prepare(&o, ActorClass::Human))?
-                    .map_err(|e| Error::Engine(e.to_string()))?;
-                if prepared.would_change.is_empty() {
+                let prepared = prepared?;
+                // The local document never holds the queued `/ops` entries, so "no change" is
+                // only knowable when nothing is queued (undoing a queued edit is a real edit).
+                if prepared.would_change.is_empty() && nothing_pending {
                     return Ok(EditOutcome::NoChange);
                 }
                 Entry {
@@ -743,12 +756,21 @@ impl Cvdb {
         self.finish_edit(&op_id)
     }
 
+    fn prepare(&self, op: &Value) -> Result<cvws::Prepared> {
+        let o = op.clone();
+        self.engine
+            .run(move |ws| ws.prepare(&o, ActorClass::Human))?
+            .map_err(|e| Error::Engine(e.to_string()))
+    }
+
     fn finish_edit(&mut self, op_id: &str) -> Result<EditOutcome> {
         self.flush()?;
         Ok(if let Some(clock) = self.acked.remove(op_id) {
             EditOutcome::Saved { clock }
         } else if let Some(reason) = self.rejected.remove(op_id) {
             EditOutcome::Rejected(reason)
+        } else if self.noops.remove(op_id) {
+            EditOutcome::NoChange
         } else {
             EditOutcome::Queued
         })
@@ -768,6 +790,11 @@ impl Cvdb {
     fn probe_due(&self) -> bool {
         self.last_probe
             .is_none_or(|t| self.clock.now().saturating_sub(t) >= RESYNC_INTERVAL)
+    }
+
+    /// Host-facing events since the last call (each is reported once).
+    pub fn take_events(&mut self) -> Vec<HostEvent> {
+        std::mem::take(&mut self.events)
     }
 
     fn send_entry(&mut self, entry: &Entry) -> Result<Sent> {
@@ -799,20 +826,53 @@ impl Cvdb {
                 self.outbox.ack(&entry.op_id)?;
                 Ok(Sent::Acked(clock))
             }
-            409 if text_of(&resp).contains("not_on_append_path") => {
+            // Only an append entry can find the flag dark; `/ops` has no such answer.
+            409 if entry.kind == EntryKind::Append
+                && text_of(&resp).contains("not_on_append_path") =>
+            {
                 self.state.mode = Some(Mode::Legacy);
                 self.convert_to_ops()?;
                 self.state.save(&self.cfg.dir)?;
                 Ok(Sent::Flipped)
             }
+            // The server runs its catalog check first: this client is outdated. The entry
+            // stays queued; the host is told once.
+            426 => {
+                if !self.events.contains(&HostEvent::Outdated) {
+                    self.events.push(HostEvent::Outdated);
+                }
+                Ok(Sent::Stay)
+            }
             // Only the API's own refusals (its JSON error shape) end an entry for good:
-            // a 400 envelope error or a 422 `op_apply_failed`. A 426 (catalog mismatch,
-            // reload), a 401/403/404 edge page or any non-JSON answer says nothing about the
-            // op: it stays queued.
+            // a 400 envelope error or a 422 `op_apply_failed`. An edge page or any other
+            // answer says nothing about the op: it stays queued.
             400 | 422 if api_error(&resp).is_some() => {
                 let reason = format!("{}: {}", resp.status, api_error(&resp).unwrap_or_default());
                 let reason: String = reason.chars().take(160).collect();
-                self.outbox.park(&entry.op_id, &reason)?;
+                if entry.kind == EntryKind::Append {
+                    // The later entries carry bytes that depend on this one's clocks. The
+                    // reload flag is saved first; then the parked line and the rewrite that
+                    // drops this entry and turns the rest into `Reapply` are ONE step.
+                    self.state.rebuild = true;
+                    self.state.save(&self.cfg.dir)?;
+                    let rest: Vec<Entry> = self
+                        .outbox
+                        .pending()
+                        .iter()
+                        .filter(|e| e.op_id != entry.op_id)
+                        .cloned()
+                        .map(|mut e| {
+                            if e.kind == EntryKind::Append {
+                                e.kind = EntryKind::Reapply;
+                                e.updates.clear();
+                            }
+                            e
+                        })
+                        .collect();
+                    self.outbox.park_replace(&entry.op_id, &reason, &rest)?;
+                } else {
+                    self.outbox.park(&entry.op_id, &reason)?;
+                }
                 Ok(Sent::Parked(reason))
             }
             _ => Ok(Sent::Stay),
@@ -820,20 +880,16 @@ impl Cvdb {
     }
 
     /// Send the outbox in producing order until something cannot be delivered. After every
-    /// ack a pending reload is attempted (once nothing with local bytes is queued); after a
-    /// parked append entry the later ones are derived again from their ops, because their
-    /// bytes depend on the parked entry's clocks.
+    /// ack a pending reload is attempted (once nothing with local bytes is queued; at most
+    /// one attempt per flush, failed ones gated by the five-minute rule).
     fn flush(&mut self) -> Result<(usize, usize)> {
         self.acked.clear();
         self.rejected.clear();
+        self.noops.clear();
         self.touched.clear();
+        self.rebuilt_this_flush = false;
         let mut sent = 0;
-        let mut guard = 0;
         loop {
-            guard += 1;
-            if guard > 100_000 {
-                break;
-            }
             self.maybe_rebuild()?;
             let Some(head) = self.outbox.pending().first().cloned() else {
                 break;
@@ -854,32 +910,24 @@ impl Cvdb {
                 Sent::Parked(reason) => {
                     sent += 1;
                     self.rejected.insert(head.op_id.clone(), reason);
-                    if head.kind == EntryKind::Append {
-                        self.rederive_after_park()?;
-                    }
                 }
             }
         }
-        self.maybe_rebuild()?;
         self.refresh_touched()?;
         Ok((sent, self.outbox.pending().len()))
     }
 
     fn note_touched(&mut self, entry: &Entry) {
-        let o = entry.op.clone();
         let routes = self
-            .engine
-            .run(move |ws| ws.prepare(&o, ActorClass::Human).map(|p| p.routes))
-            .ok()
-            .and_then(std::result::Result::ok)
-            .unwrap_or_else(|| SUB_DOCS.to_vec());
+            .prepare(&entry.op)
+            .map_or_else(|_| SUB_DOCS.to_vec(), |p| p.routes);
         self.touched.extend(routes);
     }
 
     /// Server-applied writes without a live connection: fetch the touched sub-documents so
     /// the canonical bytes arrive (one request per touched sub-document, once per flush).
     fn refresh_touched(&mut self) -> Result<()> {
-        if self.live || self.touched.is_empty() || self.state.rebuild {
+        if self.live || self.touched.is_empty() || self.needs_rebuild() {
             self.touched.clear();
             return Ok(());
         }
@@ -890,8 +938,9 @@ impl Cvdb {
         Ok(())
     }
 
-    /// Queued append entries become `/ops` entries (same opId, op only), the local document
-    /// is reloaded once none is left: the server's bytes for those ops are then the only copy.
+    /// Queued append entries become `/ops` entries (same opId, the stored envelope with its
+    /// stamped ids, no bytes); the local document is reloaded once none is left, so the
+    /// server's bytes for those ops are the only copy.
     fn convert_to_ops(&mut self) -> Result<()> {
         let mut changed = false;
         let entries: Vec<Entry> = self
@@ -909,38 +958,30 @@ impl Cvdb {
             })
             .collect();
         if changed {
-            self.outbox.replace_all(&entries)?;
+            // The flag first: a crash between the two steps must not lose the reload.
             self.state.rebuild = true;
             self.state.save(&self.cfg.dir)?;
+            self.outbox.replace_all(&entries)?;
         }
         Ok(())
     }
 
-    /// A parked append entry: later entries carry bytes that depend on its clocks. They
-    /// become `Reapply` entries and are derived again against the reloaded document.
-    fn rederive_after_park(&mut self) -> Result<()> {
-        let entries: Vec<Entry> = self
-            .outbox
-            .pending()
-            .iter()
-            .cloned()
-            .map(|mut e| {
-                if e.kind == EntryKind::Append {
-                    e.kind = EntryKind::Reapply;
-                    e.updates.clear();
-                }
-                e
-            })
-            .collect();
-        self.outbox.replace_all(&entries)?;
-        self.state.rebuild = true;
-        self.state.save(&self.cfg.dir)
+    /// The local document holds edits the server will not take, or entries wait to be derived.
+    fn needs_rebuild(&self) -> bool {
+        self.state.rebuild
+            || self
+                .outbox
+                .pending()
+                .iter()
+                .any(|e| e.kind == EntryKind::Reapply)
     }
 
-    /// Reload the local document when it holds edits the server will not take and no entry
-    /// with local bytes is pending; then derive the `Reapply` entries against it.
+    /// Reload the local document when it needs it and no entry with local bytes is pending;
+    /// then derive the `Reapply` entries against it. A failed reload leaves the document as
+    /// it was and is not tried again within five minutes.
     fn maybe_rebuild(&mut self) -> Result<()> {
-        if !self.state.rebuild
+        if !self.needs_rebuild()
+            || self.rebuilt_this_flush
             || self
                 .outbox
                 .pending()
@@ -949,10 +990,21 @@ impl Cvdb {
         {
             return Ok(());
         }
+        let now = self.clock.now();
+        if self
+            .rebuild_failed_at
+            .is_some_and(|t| now.saturating_sub(t) < RESYNC_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.rebuilt_this_flush = true;
         match self.rebuild() {
-            Ok(()) => {}
-            Err(Error::Offline | Error::Server(_)) => return Ok(()),
-            Err(e) => return Err(e),
+            Ok(()) => self.rebuild_failed_at = None,
+            Err(e @ (Error::Engine(_) | Error::EngineStopped | Error::Io(_))) => return Err(e),
+            Err(_) => {
+                self.rebuild_failed_at = Some(now);
+                return Ok(());
+            }
         }
         self.state.rebuild = false;
         self.state.save(&self.cfg.dir)?;
@@ -976,7 +1028,8 @@ impl Cvdb {
             let op = entries[i].op.clone();
             match self.apply_local(&op) {
                 Ok(out) if out.is_empty() => {
-                    entries.remove(i);
+                    // Nothing left to do: the server's document already has the effect.
+                    self.noops.insert(entries.remove(i).op_id);
                 }
                 Ok(out) => {
                     entries[i].kind = EntryKind::Append;
@@ -986,16 +1039,18 @@ impl Cvdb {
                         .collect();
                     i += 1;
                 }
-                Err(e) => {
+                Err(Error::Engine(e)) => {
                     // The op no longer applies to the server's document.
                     let reason = format!("does not apply after the reload: {e}");
-                    self.outbox.replace_all(&entries)?;
                     let id = entries[i].op_id.clone();
-                    self.outbox.park(&id, &reason)?;
+                    entries.remove(i);
+                    self.outbox.park_replace(&id, &reason, &entries)?;
                     self.rejected.insert(id, reason);
-                    entries = self.outbox.pending().to_vec();
-                    // restart the scan: indices moved
-                    i = 0;
+                }
+                // The engine is gone, not the op: keep every entry and let the host see it.
+                Err(e) => {
+                    self.outbox.replace_all(&entries)?;
+                    return Err(e);
                 }
             }
         }
@@ -1006,6 +1061,12 @@ impl Cvdb {
     /// first one that cannot be delivered (order is kept). Returns (sent, left).
     pub fn replay(&mut self) -> Result<(usize, usize)> {
         self.flush()
+    }
+
+    /// Test hook: make outbox rewrites fail.
+    #[doc(hidden)]
+    pub fn inject_outbox_rewrite_failure(&mut self, fail: bool) {
+        self.outbox.inject_rewrite_failure(fail);
     }
 
     /// Persist the cached documents (call on a clean shutdown).
@@ -1032,4 +1093,37 @@ impl Cvdb {
         );
         (live, rx)
     }
+}
+
+/// Apply the frames of one sub-document to `engine`: with `replace` the head becomes the
+/// document through `open`, otherwise every frame merges through `receive`. Returns whether
+/// the resync flag was raised and the merged state.
+fn apply_frames(
+    engine: &Engine,
+    sub: SubDoc,
+    frames: Vec<Vec<u8>>,
+    replace: bool,
+) -> Result<(bool, Vec<u8>)> {
+    engine.run(move |ws| {
+        let mut iter = frames.into_iter();
+        if replace && let Some(head) = iter.next() {
+            let other: Vec<(SubDoc, Vec<u8>)> = SUB_DOCS
+                .iter()
+                .filter(|s| **s != sub)
+                .map(|s| (*s, ws.encode_state(*s)))
+                .collect();
+            let mut states: Vec<(SubDoc, &[u8])> =
+                other.iter().map(|(s, b)| (*s, b.as_slice())).collect();
+            states.push((sub, head.as_slice()));
+            *ws = Workspace::open(&states).map_err(|e| Error::Engine(e.to_string()))?;
+        }
+        let mut flagged = false;
+        for f in iter {
+            if let Ok(a) = ws.receive(&f, Some(sub)) {
+                flagged |= a.resync;
+            }
+        }
+        flagged |= ws.take_resync();
+        Ok((flagged, ws.encode_state(sub)))
+    })?
 }

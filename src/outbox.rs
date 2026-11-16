@@ -96,6 +96,7 @@ pub struct Outbox {
     file: File,
     pending: Vec<Entry>,
     notices: Vec<Parked>,
+    fail_rewrite: bool,
 }
 
 impl Outbox {
@@ -103,6 +104,7 @@ impl Outbox {
         crate::link::create_private_dir(dir)?;
         let path = dir.join("outbox.log");
         let parked_path = dir.join("parked.log");
+        crate::link::tighten(&[&path, &parked_path]);
         // Only a missing file is an empty outbox: any other read error must not turn into one.
         let text = match std::fs::read(&path) {
             Ok(t) => t,
@@ -161,6 +163,7 @@ impl Outbox {
             file,
             pending: entries,
             notices,
+            fail_rewrite: false,
         })
     }
 
@@ -184,6 +187,9 @@ impl Outbox {
 
     /// Replace every pending entry (same order, possibly changed kind or bytes), atomically.
     pub fn replace_all(&mut self, entries: &[Entry]) -> Result<()> {
+        if self.fail_rewrite {
+            return Err(Error::Io("injected rewrite failure".into()));
+        }
         self.file = rewrite(&self.path, entries)?;
         self.pending = entries.to_vec();
         Ok(())
@@ -211,6 +217,29 @@ impl Outbox {
             reason: reason.to_owned(),
         });
         self.ack(op_id)
+    }
+
+    /// The server refused `op_id` for good: record it in `parked.log`, then drop it from the
+    /// outbox and replace the entries that follow it (`rest`, same order) in ONE atomic rewrite.
+    /// A crash before the rewrite leaves the entry pending, so it is sent and parked again;
+    /// there is no state in which the entry is gone but its dependants still carry their old bytes.
+    pub fn park_replace(&mut self, op_id: &str, reason: &str, rest: &[Entry]) -> Result<()> {
+        if let Some(e) = self.pending.iter().find(|e| e.op_id == op_id) {
+            let payload = e.to_json();
+            park_line(&self.parked_path, reason, B64.encode(payload).as_bytes())?;
+        }
+        self.replace_all(rest)?;
+        self.notices.push(Parked {
+            op_id: Some(op_id.to_owned()),
+            reason: reason.to_owned(),
+        });
+        Ok(())
+    }
+
+    /// Test hook: make the next rewrites fail.
+    #[doc(hidden)]
+    pub fn inject_rewrite_failure(&mut self, fail: bool) {
+        self.fail_rewrite = fail;
     }
 
     /// Test hook: make every following write fail with ENOSPC (`/dev/full`).
@@ -261,6 +290,7 @@ fn rewrite(path: &Path, entries: &[Entry]) -> Result<File> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    crate::link::sync_parent(path)?;
     std::fs::OpenOptions::new()
         .append(true)
         .open(path)

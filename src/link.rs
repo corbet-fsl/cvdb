@@ -94,12 +94,22 @@ pub(crate) fn sync_parent(path: &Path) -> Result<()> {
 
 /// Create `dir` (and parents) with mode 0700.
 pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)?;
+    // An existing directory keeps its old mode otherwise.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+/// Make existing private files 0600 (they may predate the mode rule). Missing files are fine.
+pub(crate) fn tighten(paths: &[&Path]) {
+    use std::os::unix::fs::PermissionsExt;
+    for p in paths {
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 pub(crate) fn open_private(path: &Path) -> Result<std::fs::File> {
