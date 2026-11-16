@@ -339,6 +339,118 @@ fn e2e() {
     legacy_and_mode_switches(&stack);
     rejection_and_corruption(&stack);
     budget(&stack);
+    ts_interop(&stack);
+}
+
+fn ts_peer(stack: &Stack, args: &[&str]) -> String {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e/ts_peer.ts");
+    let out = Command::new("bun")
+        .arg(script)
+        .arg(args[0])
+        .arg(&stack.api)
+        .args(&args[1..])
+        .env("CV_ROOT", &stack.cv_root)
+        .current_dir(stack.cv_root.join("ui"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Real `CareerVector` TS SDK appends (human class) reach a cvdb peer through the relay byte for byte.
+fn ts_interop(stack: &Stack) {
+    use base64::Engine as _;
+    // T1 fixtures: produced by the SDK on a fresh append workspace; set CVDB_REGEN_FIXTURES=1 to refresh the checked-in copy.
+    let fresh = stack.create_workspace();
+    stack.set_write_path(&fresh, "append");
+    let dir = tmp("fixtures");
+    ts_peer(stack, &["fixtures", &fresh, dir.to_str().unwrap()]);
+    if std::env::var("CVDB_REGEN_FIXTURES").is_ok() {
+        let dest = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        std::fs::create_dir_all(&dest).unwrap();
+        for f in [
+            "u0.bin",
+            "u1.bin",
+            "u2.bin",
+            "frames.bin",
+            "relay.bin",
+            "expected.json",
+            "source.txt",
+        ] {
+            std::fs::copy(dir.join(f), dest.join(f)).unwrap();
+        }
+    }
+
+    // Live interop: a cvdb peer seeds, the TS SDK edits, the relay delivers the SDK's exact bytes.
+    let ws = stack.create_workspace();
+    stack.set_write_path(&ws, "append");
+    let (spy, clock) = (Spy::new(), Arc::new(ManualClock::default()));
+    let mut a = client(stack, &ws, &tmp("interop"), &spy, &clock);
+    a.attach().unwrap();
+    seed(&mut a);
+    let (_live, rx) = a.start_live();
+    a.set_live(true);
+    wait_for(|| {
+        matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Ok(Event::Connected)
+        )
+        .then_some(())
+    });
+    let ops = tmp("ops").join("ops.json");
+    std::fs::write(
+        &ops,
+        serde_json::to_vec(&json!([
+            set_cv("from the TS SDK"),
+            set_cl("cl from the TS SDK")
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = ts_peer(stack, &["edit", &ws, ops.to_str().unwrap()]);
+    let accepted: Vec<(String, Vec<u8>)> = out
+        .lines()
+        .filter(|l| l.starts_with('{'))
+        .map(|l| {
+            let v: Value = serde_json::from_str(l).unwrap();
+            (
+                v["sub"].as_str().unwrap().to_owned(),
+                base64::engine::general_purpose::STANDARD
+                    .decode(v["update"].as_str().unwrap())
+                    .unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(accepted.len(), 2, "{out}");
+    let mut received = Vec::new();
+    wait_for(|| {
+        if let Ok(Event::Update(u)) = rx.recv_timeout(Duration::from_millis(50)) {
+            received.push(u);
+        }
+        (received.len() >= 2).then_some(())
+    });
+    for (sub, bytes) in &accepted {
+        assert!(
+            received.contains(bytes),
+            "the relay delivered the SDK's {sub} bytes exactly"
+        );
+    }
+    for u in &received {
+        a.apply_live(u).unwrap();
+    }
+    assert_eq!(cv_text(&a), "from the TS SDK");
+    assert_eq!(cl_text(&a), "cl from the TS SDK");
+    // A cold peer loads the same result (head plus the SDK's tail), and the SDK read the Rust peer's seed.
+    let mut b = client(stack, &ws, &tmp("interop-b"), &Spy::new(), &clock);
+    b.attach().unwrap();
+    assert_eq!(cv_text(&b), "from the TS SDK");
+    assert_human_only(&spy);
+    println!("ts_interop ok");
 }
 
 fn cold_load_and_live(stack: &Stack) {
