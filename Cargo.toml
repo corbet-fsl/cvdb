@@ -11,7 +11,14 @@ keywords = ["crdt", "sync", "yjs", "cv"]
 categories = ["network-programming", "data-structures"]
 include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE.md", ".cargo/release-profile.toml"]
 
+[features]
+default = ["sqlite"]
+# The SQLite storage backend (`cvdb::store`), speaking the cvfs record vocabulary.
+sqlite = ["dep:rusqlite", "dep:cvfs"]
+
 [dependencies]
+cvfs = { git = "https://git.corbet.ch/corbet-fsl/cvfs.git", rev = "bef17ba278b3e45622fd89251bb084035cc4156e", optional = true }
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 cvws = { git = "https://git.corbet.ch/corbet-fsl/cvws.git", rev = "06dbb8c" }
 serde_json = "1"
 base64 = "0.22"
@@ -20,6 +27,9 @@ fastrand = "2"
 ureq = "3"
 socket2 = { version = "0.6", features = ["all"] }
 tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

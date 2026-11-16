@@ -12,6 +12,8 @@ pub mod http;
 pub mod link;
 pub mod live;
 pub mod outbox;
+#[cfg(feature = "sqlite")]
+pub mod store;
 
 pub use client::{Clock, Config, Cvdb, EditOutcome, HostEvent, Mode, SystemClock};
 pub use error::Error;

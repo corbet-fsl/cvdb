@@ -77,3 +77,12 @@ a deployed Worker.
 ## Licence
 
 FSL-1.1-ALv2, see `LICENSE.md`.
+
+## SQLite storage backend (`cvdb::store`, feature `sqlite`, on by default)
+
+`cvdb::store::SqliteStore` is the database backend of the CareerVector workspace (`cvws`): the same
+logical rows `cvfs` keeps as files, in one SQLite file or in memory. Tables: `workspaces`,
+`documents`, `snapshots` (retained revisions), `workspace_sub_doc_ops` (Yjs op log), `receipts`,
+`files` (assets). Conditional writes (CAS on revision and Yjs clock), hash integrity and receipts
+behave exactly as in `cvfs`; both speak the `cvfs` record vocabulary, so `dump` and `restore` move a
+workspace between the two without loss. It never parses document bytes or metadata.
