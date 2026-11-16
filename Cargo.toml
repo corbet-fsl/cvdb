@@ -1,16 +1,47 @@
 [package]
 name = "cvdb"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Streaming JSON Lines reader and compact value document command"
+rust-version = "1.94"
+description = "Workspace sync client for CareerVector: load, live relay, durable outbox, append and server-applied writes over cvws"
 license = "FSL-1.1-ALv2"
 readme = "README.md"
 repository = "https://git.corbet.ch/corbet-fsl/cvdb"
-homepage = "https://git.corbet.ch/corbet-fsl/cvdb"
-keywords = ["json", "jsonl", "ndjson"]
-categories = ["encoding", "command-line-utilities"]
+keywords = ["crdt", "sync", "yjs", "cv"]
+categories = ["network-programming", "data-structures"]
 include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE.md", ".cargo/release-profile.toml"]
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+cvws = { git = "https://git.corbet.ch/corbet-fsl/cvws.git", rev = "06dbb8c" }
 serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"
+fastrand = "2"
+ureq = "3"
+tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+# Intentional: masked byte writes, small exact integers to f64, test assertions on emptiness.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+assert_is_empty = "allow"
+format_push_string = "allow"
+similar_names = "allow"
+needless_pass_by_value = "allow"
+unnecessary_wraps = "allow"
+
+# cvws pulls ccvl-core, which needs releases not yet on crates.io; a consumer of
+# a git dependency does not inherit the patch table, so it is repeated here at the
+# revisions cvws pins. Remove an entry once its release is published.
+[patch.crates-io]
+cdate = { git = "https://git.corbet.ch/corbet-libre/cdate.git", rev = "2dff4ec4ac5a915ec8bcf2bcb0e3c31ad50248de" }
+cink = { git = "https://git.corbet.ch/corbet-libre/cink.git", rev = "c9497016f27150aface01c0a4b32aa18d15f87ab" }
+cletter = { git = "https://git.corbet.ch/corbet-libre/cletter.git", rev = "940d6f13b385ed48d49f0c53ccb7d3a79bc6e855" }
+cnice = { git = "https://git.corbet.ch/corbet-libre/cnice.git", rev = "decad9624261756fba749235ab418ba4c543740a" }
