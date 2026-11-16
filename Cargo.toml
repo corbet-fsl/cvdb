@@ -3,7 +3,7 @@ name = "cvdb"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Workspace sync client for CareerVector: load, live relay, durable outbox, append and server-applied writes over cvws"
+description = "Database backend for CareerVector workspaces: SQLite store and the byte transport pieces (http, link, live relay, durable outbox)"
 license = "FSL-1.1-ALv2"
 readme = "README.md"
 repository = "https://git.corbet.ch/corbet-fsl/cvdb"
@@ -17,9 +17,8 @@ default = ["sqlite"]
 sqlite = ["dep:rusqlite", "dep:cvfs"]
 
 [dependencies]
-cvfs = { git = "https://git.corbet.ch/corbet-fsl/cvfs.git", rev = "bef17ba278b3e45622fd89251bb084035cc4156e", optional = true }
+cvfs = { git = "https://git.corbet.ch/corbet-fsl/cvfs.git", branch = "main", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
-cvws = { git = "https://git.corbet.ch/corbet-fsl/cvws.git", rev = "06dbb8c" }
 serde_json = "1"
 base64 = "0.22"
 sha2 = "0.10"
@@ -47,12 +46,3 @@ format_push_string = "allow"
 similar_names = "allow"
 needless_pass_by_value = "allow"
 unnecessary_wraps = "allow"
-
-# cvws pulls ccvl-core, which needs releases not yet on crates.io; a consumer of
-# a git dependency does not inherit the patch table, so it is repeated here at the
-# revisions cvws pins. Remove an entry once its release is published.
-[patch.crates-io]
-cdate = { git = "https://git.corbet.ch/corbet-libre/cdate.git", rev = "2dff4ec4ac5a915ec8bcf2bcb0e3c31ad50248de" }
-cink = { git = "https://git.corbet.ch/corbet-libre/cink.git", rev = "c9497016f27150aface01c0a4b32aa18d15f87ab" }
-cletter = { git = "https://git.corbet.ch/corbet-libre/cletter.git", rev = "940d6f13b385ed48d49f0c53ccb7d3a79bc6e855" }
-cnice = { git = "https://git.corbet.ch/corbet-libre/cnice.git", rev = "decad9624261756fba749235ab418ba4c543740a" }

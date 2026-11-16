@@ -1,11 +1,8 @@
-//! `cvdb`: the workspace sync client for `CareerVector`.
-//!
-//! It moves bytes and typed envelopes between a [`cvws::Workspace`] and a `CareerVector`
-//! workspace server; it never interprets what the documents say. See the README.
+//! `cvdb`: the database backend of the `CareerVector` workspace: the SQLite store and the byte
+//! transport pieces. It moves opaque bytes and never applies or merges documents.
 
 #![forbid(unsafe_code)]
 
-pub mod client;
 pub mod error;
 pub mod frames;
 pub mod http;
@@ -15,7 +12,6 @@ pub mod outbox;
 #[cfg(feature = "sqlite")]
 pub mod store;
 
-pub use client::{Clock, Config, Cvdb, EditOutcome, HostEvent, Mode, SystemClock};
 pub use error::Error;
 pub use http::{Counts, Http, Kind, UreqHttp};
 pub use link::Link;

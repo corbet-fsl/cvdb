@@ -3,7 +3,7 @@
 use crate::error::{Error, Result};
 
 /// Frames over this size are refused without being decoded (the `cvws` cap).
-pub const MAX_FRAME: usize = cvws::MAX_FRAME_BYTES;
+pub const MAX_FRAME: usize = 1 << 20;
 
 /// The first frame of a framed body is the stored head, a whole state: `cvws` puts no cap on
 /// whole states, so it gets a larger one (heads are about 20 KB today). Merged tails and relay
