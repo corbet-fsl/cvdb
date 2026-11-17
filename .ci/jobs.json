@@ -2,8 +2,36 @@
   "schema": 1,
   "generator": "ccid render v1",
   "tool_revision": "",
-  "manifest_sha256": "01705b8bf15f63f71b6e2c383424bbaeb74cc4250a83d4d5160f5f237f01626e",
+  "manifest_sha256": "3ad76afaffbf564a94e27fbf62fdba219c3de90b8c13e2e392dbaf1e7d9f4427",
   "jobs": {
+    "release": {
+      "job": "release",
+      "scheduler": "forgejo",
+      "checks": [
+        "pack"
+      ],
+      "workflow": "release",
+      "command": [
+        "ccid:release-build"
+      ],
+      "runs_on": "linux",
+      "events": [
+        "manual"
+      ]
+    },
+    "release-promote": {
+      "job": "release-promote",
+      "scheduler": "forgejo",
+      "checks": [],
+      "workflow": "release",
+      "command": [
+        "ccid:release-promote"
+      ],
+      "runs_on": "linux",
+      "events": [
+        "manual"
+      ]
+    },
     "verify": {
       "job": "verify",
       "scheduler": "forgejo",

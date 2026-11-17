@@ -1,5 +1,9 @@
 # cvdb
 
+<!-- ccid:security:begin (rendered by ccid render; do not edit by hand) -->
+**Security and dependencies:** watched by Renovate (with OSV vulnerability alerts); an update is merged only when its tests pass. See the [security policy](SECURITY.md).
+<!-- ccid:security:end -->
+
 The database backend of the CareerVector workspace (`cvws`). It moves opaque bytes and never applies
 or merges documents. It holds the SQLite store (`cvdb::store`) and the byte transport pieces
 (`http`, `link`, `live` relay, durable `outbox`).
