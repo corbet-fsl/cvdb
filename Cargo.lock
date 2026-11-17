@@ -105,7 +105,8 @@ dependencies = [
 [[package]]
 name = "cvfs"
 version = "0.1.0"
-source = "git+https://git.corbet.ch/corbet-fsl/cvfs.git?branch=main#699216eba2062245758f13338a8fa178e6ce1f65"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "049c6c19fea6d9a04d0910acc6da7710c39885870752c466cd40d11234d18ef8"
 dependencies = [
  "serde",
  "serde_json",
