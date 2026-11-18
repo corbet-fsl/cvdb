@@ -268,12 +268,15 @@ impl Outbox {
 }
 
 fn park_line(path: &Path, reason: &str, line: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    // Windows: no mode bits; the per-user profile ACL already applies.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path)?;
     f.write_all(format!("{reason}\t{}\n", B64.encode(line)).as_bytes())?;
     f.sync_all()?;
     Ok(())

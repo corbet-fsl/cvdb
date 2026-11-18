@@ -92,20 +92,30 @@ pub(crate) fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create `dir` (and parents) with mode 0700.
+/// Create `dir` (and parents) with mode 0700. Windows has no mode bits: the
+/// per-user profile ACL already applies, so the mode calls are Unix-only.
 pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
     // An existing directory keeps its old mode otherwise.
     // Best effort: a directory owned by someone else or on vfat/CIFS refuses a chmod.
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
     Ok(())
 }
 
 /// Make existing private files 0600 (they may predate the mode rule). Missing files are fine.
+/// A no-op on Windows (the per-user profile ACL already applies).
+#[cfg(unix)]
 pub(crate) fn tighten(paths: &[&Path]) {
     use std::os::unix::fs::PermissionsExt;
     for p in paths {
@@ -113,14 +123,19 @@ pub(crate) fn tighten(paths: &[&Path]) {
     }
 }
 
+#[cfg(not(unix))]
+pub(crate) fn tighten(_paths: &[&Path]) {}
+
 pub(crate) fn open_private(path: &Path) -> Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    Ok(std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Windows: no mode bits; the per-user profile ACL already applies.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    Ok(options.open(path)?)
 }
 
 impl fmt::Debug for Link {
@@ -157,6 +172,7 @@ mod tests {
         assert!(!format!("{l:?}{l}").contains("secretsecret123"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn saved_0600() {
         use std::os::unix::fs::PermissionsExt;
