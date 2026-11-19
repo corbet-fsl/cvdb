@@ -36,7 +36,8 @@
       "job": "verify",
       "scheduler": "forgejo",
       "checks": [
-        "rust"
+        "rust",
+        "portable-paths"
       ],
       "workflow": "ci",
       "command": [
